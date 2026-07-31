@@ -85,11 +85,14 @@ func (s *Server) LoadConfig(ctx context.Context, config *filterapi.Config) error
 		return fmt.Errorf("cannot create runtime filter config: %w", err)
 	}
 
-	// Attach a shared in-process context-cache resolver for each GCP Vertex AI backend.
-	// The resolver is reused across requests so the in-memory TTL memo is preserved.
+	// Attach a shared in-process context-cache resolver for each GCP Vertex AI backend
+	// that has context caching explicitly enabled. The resolver is reused across requests
+	// so the in-memory TTL memo is preserved.
 	for _, rb := range newConfig.Backends {
 		if _, ok := rb.Handler.(filterapi.GCPAuthHandler); ok {
-			rb.CacheResolver = gcpcache.New(nil)
+			if rb.Backend.GCPContextCaching != nil && rb.Backend.GCPContextCaching.Enabled {
+				rb.CacheResolver = gcpcache.New(nil)
+			}
 		}
 	}
 

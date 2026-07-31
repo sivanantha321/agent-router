@@ -76,8 +76,34 @@ type AIServiceBackendSpec struct {
 	// +optional
 	BodyMutation *HTTPBodyMutation `json:"bodyMutation,omitempty"`
 
+	// GCPContextCaching configures Gemini context caching for this backend.
+	// When set, the ai-gateway will automatically resolve or create a Google cachedContents
+	// entry for requests that carry Anthropic-style cache_control markers, and inject the
+	// resolved cache resource name into the Gemini API request.
+	// This field is only meaningful for GCPVertexAI backends.
+	// +optional
+	GCPContextCaching *GCPContextCachingSpec `json:"gcpContextCaching,omitempty"`
+
 	// TODO: maybe add backend-level LLMRequestCost configuration that overrides the AIGatewayRoute-level LLMRequestCost.
 	// 	That may be useful for the backend that has a different cost calculation logic.
+}
+
+// GCPContextCachingSpec configures in-process Gemini context caching for a GCP Vertex AI backend.
+type GCPContextCachingSpec struct {
+	// Enabled controls whether context caching is active for this backend.
+	// When false, cache_control markers in requests are ignored and no cachedContents
+	// API calls are made.
+	//
+	// +kubebuilder:validation:Required
+	Enabled bool `json:"enabled"`
+
+	// DefaultTTL is the default time-to-live for newly created cache entries, expressed
+	// as a GCP duration string (e.g. "600s"). When empty, the default of 300s is used.
+	// Must be at least "60s" per GCP API requirements.
+	//
+	// +optional
+	// +kubebuilder:validation:Pattern=`^[1-9][0-9]*s$`
+	DefaultTTL string `json:"defaultTTL,omitempty"`
 }
 
 // HTTPHeaderMutation defines the mutation of HTTP headers that will be applied to the request

@@ -207,6 +207,22 @@ type Backend struct {
 	// HeaderValueFilters filter individual values out of multi-valued request headers before sending
 	// the request to the backend. Optional.
 	HeaderValueFilters []HTTPHeaderValueFilter `json:"headerValueFilters,omitempty"`
+	// GCPContextCaching configures Gemini context caching for this backend. Optional.
+	// When non-nil and Enabled is true, the extproc will resolve or create a Google
+	// cachedContents entry for requests that carry cache_control markers.
+	GCPContextCaching *GCPContextCaching `json:"gcpContextCaching,omitempty"`
+}
+
+// GCPContextCaching configures in-process Gemini context caching for a GCP Vertex AI backend.
+type GCPContextCaching struct {
+	// Enabled controls whether context caching is active for this backend.
+	// When false (or when this struct is nil), cache_control markers in requests
+	// are ignored and no cachedContents API calls are made.
+	Enabled bool `json:"enabled"`
+	// DefaultTTL is the default time-to-live for newly created cache entries expressed
+	// as a GCP duration string (e.g. "600s"). When empty, the resolver default (300s) is used.
+	// +optional
+	DefaultTTL string `json:"defaultTTL,omitempty"`
 }
 
 // BackendAuth corresponds partially to BackendSecurityPolicy in api/v1alpha1/api.go.

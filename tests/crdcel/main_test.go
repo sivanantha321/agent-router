@@ -95,6 +95,11 @@ func TestAIServiceBackends(t *testing.T) {
 	}{
 		{name: "basic.yaml"},
 		{name: "anthropic-schema.yaml"},
+		{name: "gcp-context-caching-enabled.yaml"},
+		{
+			name:   "gcp-context-caching-invalid-ttl.yaml",
+			expErr: "spec.gcpContextCaching.defaultTTL",
+		},
 		{name: "basic-eg-backend-aws.yaml"},
 		{name: "aws-openai-schema.yaml"},
 		{name: "basic-eg-backend-azure.yaml"},

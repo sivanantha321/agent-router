@@ -53,6 +53,61 @@ func TestServer_LoadConfig(t *testing.T) {
 	require.NotNil(t, s.config)
 }
 
+// TestServer_LoadConfig_GCPCacheResolver verifies that a CacheResolver is attached
+// to a GCP backend only when GCPContextCaching.Enabled is true.
+func TestServer_LoadConfig_GCPCacheResolver(t *testing.T) {
+	s := &Server{}
+
+	config := &filterapi.Config{
+		Backends: []filterapi.Backend{
+			{
+				Name:   "gcp-caching-on",
+				Schema: filterapi.VersionedAPISchema{Name: filterapi.APISchemaGCPVertexAI},
+				Auth: &filterapi.BackendAuth{
+					GCPAuth: &filterapi.GCPAuth{AccessToken: "token"},
+				},
+				GCPContextCaching: &filterapi.GCPContextCaching{Enabled: true, DefaultTTL: "600s"},
+			},
+			{
+				Name:   "gcp-caching-off",
+				Schema: filterapi.VersionedAPISchema{Name: filterapi.APISchemaGCPVertexAI},
+				Auth: &filterapi.BackendAuth{
+					GCPAuth: &filterapi.GCPAuth{AccessToken: "token"},
+				},
+				GCPContextCaching: &filterapi.GCPContextCaching{Enabled: false},
+			},
+			{
+				Name:   "gcp-no-caching-field",
+				Schema: filterapi.VersionedAPISchema{Name: filterapi.APISchemaGCPVertexAI},
+				Auth: &filterapi.BackendAuth{
+					GCPAuth: &filterapi.GCPAuth{AccessToken: "token"},
+				},
+				// GCPContextCaching is nil.
+			},
+			{
+				Name:   "non-gcp",
+				Schema: filterapi.VersionedAPISchema{Name: filterapi.APISchemaOpenAI},
+				// No auth handler → not a GCPAuthHandler.
+			},
+		},
+	}
+
+	err := s.LoadConfig(t.Context(), config)
+	require.NoError(t, err)
+
+	rb := s.config.Backends["gcp-caching-on"]
+	require.NotNil(t, rb.CacheResolver, "CacheResolver must be set when GCPContextCaching.Enabled=true")
+
+	rb = s.config.Backends["gcp-caching-off"]
+	require.Nil(t, rb.CacheResolver, "CacheResolver must be nil when GCPContextCaching.Enabled=false")
+
+	rb = s.config.Backends["gcp-no-caching-field"]
+	require.Nil(t, rb.CacheResolver, "CacheResolver must be nil when GCPContextCaching is absent")
+
+	rb = s.config.Backends["non-gcp"]
+	require.Nil(t, rb.CacheResolver, "CacheResolver must be nil for non-GCP backends")
+}
+
 func TestServer_Check(t *testing.T) {
 	s, _ := requireNewServerWithMockProcessor(t)
 
