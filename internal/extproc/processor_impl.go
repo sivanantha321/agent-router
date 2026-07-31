@@ -24,10 +24,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/types/known/structpb"
 
+	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
 	"github.com/envoyproxy/ai-gateway/internal/backendauth"
 	"github.com/envoyproxy/ai-gateway/internal/bodymutator"
 	"github.com/envoyproxy/ai-gateway/internal/endpointspec"
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
+	"github.com/envoyproxy/ai-gateway/internal/gcpcache"
 	"github.com/envoyproxy/ai-gateway/internal/headermutator"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 	"github.com/envoyproxy/ai-gateway/internal/json"
@@ -128,6 +130,9 @@ type (
 		backendName        string
 		routeName          string
 		handler            filterapi.BackendAuthHandler
+		// cacheResolver is the GCP context-cache resolver for this backend.
+		// Non-nil only for GCP Vertex AI backends; set in SetBackend.
+		cacheResolver gcpcache.CacheResolver
 		// cost is the cost of the request that is accumulated during the processing of the response.
 		costs metrics.TokenUsage
 		// metrics tracking.
@@ -359,8 +364,35 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 	// We force the body mutation in the following cases:
 	// * The request is a retry request because the body mutation might have happened the previous iteration.
 	// * The request is a streaming request, and the IncludeUsage option is set to false since we need to ensure that
-	//	the token usage is calculated correctly without being bypassed.
+	//	the token usage is calculated correctly without being pypassed.
 	forceBodyMutation := u.onRetry() || u.parent.forceBodyMutation
+
+	// Resolve GCP context cache when the resolver is present and the translator supports
+	// cache injection. This must happen before RequestBody so the translator can use
+	// the resolved cache name and filtered message list.
+	if u.cacheResolver != nil {
+		if cacheSetter, ok := u.translator.(translator.GCPCacheSetter); ok {
+			if gcpAuth, ok := u.handler.(filterapi.GCPAuthHandler); ok {
+				if req, ok := any(u.parent.originalRequestBody).(*openai.ChatCompletionRequest); ok {
+					result, resolveErr := u.cacheResolver.Resolve(ctx, req, gcpAuth)
+					if resolveErr != nil {
+						u.logger.Error("GCP context cache resolution failed", slog.String("error", resolveErr.Error()))
+						u.metrics.RecordRequestCompletion(ctx, false, u.requestHeaders)
+						return createUserFacingErrorResponse(502, "UpstreamError", "upstream cache service error"), nil
+					}
+					if result != nil {
+						cacheSetter.SetGCPCacheResult(&translator.GCPCacheResult{
+							CacheName:        result.CacheName,
+							FilteredMessages: result.Messages,
+							Created:          result.Created,
+							WriteTokenCount:  uint32(result.TokenCount), //nolint:gosec
+						})
+					}
+				}
+			}
+		}
+	}
+
 	newHeaders, newBody, err := u.translator.RequestBody(u.parent.originalRequestBodyRaw, u.parent.originalRequestBody, forceBodyMutation)
 	if err != nil {
 		if userFacingErr := internalapi.GetUserFacingError(err); userFacingErr != nil {
@@ -705,6 +737,9 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) SetBackend(c
 	u.backendName = backend.Backend.Name
 	u.routeName = routeName
 	u.handler = backend.Handler
+	if cr, ok := backend.CacheResolver.(gcpcache.CacheResolver); ok {
+		u.cacheResolver = cr
+	}
 	u.headerMutator = headermutator.NewHeaderMutator(backend.Backend.HeaderMutation, rp.requestHeaders)
 	u.bodyMutator = bodymutator.NewBodyMutator(backend.Backend.BodyMutation, rp.originalRequestBodyRaw)
 	// Header-derived labels/CEL must be able to see the overridden request model.

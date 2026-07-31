@@ -92,6 +92,14 @@ type openAIToGCPVertexAITranslatorV1ChatCompletion struct {
 	debugLogEnabled bool
 	enableRedaction bool
 	logger          *slog.Logger
+	// pendingCacheResult is set by SetGCPCacheResult before RequestBody is called.
+	// When non-nil, the cache name is injected into the Gemini request and the
+	// filtered (non-cached) messages replace the original message list.
+	pendingCacheResult *GCPCacheResult
+	// cacheWriteTokens is the number of tokens stored in a newly created cache entry.
+	// Set during RequestBody (from pendingCacheResult) and consumed in ResponseBody to
+	// record cache-write cost via tokenUsage.SetCacheCreationInputTokens.
+	cacheWriteTokens uint32
 }
 
 // RequestBody implements [OpenAIChatCompletionTranslator.RequestBody] for GCP Gemini.
@@ -126,6 +134,14 @@ func (o *openAIToGCPVertexAITranslatorV1ChatCompletion) RequestBody(_ []byte, op
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// Capture cache-write token count for cost attribution in ResponseBody, then clear
+	// the pending result so retries start fresh (the resolver will re-check the memo).
+	if o.pendingCacheResult != nil {
+		o.cacheWriteTokens = o.pendingCacheResult.WriteTokenCount
+		o.pendingCacheResult = nil
+	}
+
 	newBody, err = json.Marshal(gcpReq)
 	if err != nil {
 		return nil, nil, fmt.Errorf("error marshaling Gemini request: %w", err)
@@ -202,6 +218,10 @@ func (o *openAIToGCPVertexAITranslatorV1ChatCompletion) ResponseBody(_ map[strin
 	if openAIResp.Usage.CompletionTokensDetails != nil {
 		tokenUsage.SetReasoningTokens(uint32(openAIResp.Usage.CompletionTokensDetails.ReasoningTokens)) //nolint:gosec
 	}
+	// Attribute cache-write tokens when a new cache entry was created for this request.
+	if o.cacheWriteTokens > 0 {
+		tokenUsage.SetCacheCreationInputTokens(o.cacheWriteTokens)
+	}
 
 	if span != nil {
 		span.RecordResponse(openAIResp)
@@ -266,6 +286,10 @@ func (o *openAIToGCPVertexAITranslatorV1ChatCompletion) handleStreamingResponse(
 			tokenUsage.SetTotalTokens(uint32(usage.TotalTokens))                                 //nolint:gosec
 			tokenUsage.SetCachedInputTokens(uint32(usage.PromptTokensDetails.CachedTokens))      //nolint:gosec
 			tokenUsage.SetReasoningTokens(uint32(usage.CompletionTokensDetails.ReasoningTokens)) //nolint:gosec
+			// Attribute cache-write tokens when a new cache entry was created for this request.
+			if o.cacheWriteTokens > 0 {
+				tokenUsage.SetCacheCreationInputTokens(o.cacheWriteTokens)
+			}
 		}
 	}
 
@@ -523,8 +547,15 @@ func getGenerationConfigThinkingConfig(tu *openai.ThinkingUnion) *genai.Thinking
 
 // openAIMessageToGeminiMessage converts an OpenAI ChatCompletionRequest to a GCP Gemini GenerateContentRequest.
 func (o *openAIToGCPVertexAITranslatorV1ChatCompletion) openAIMessageToGeminiMessage(openAIReq *openai.ChatCompletionRequest, requestModel internalapi.RequestModel) (*gcp.GenerateContentRequest, error) {
+	// If a cache result is pending (set by SetGCPCacheResult), use the filtered (non-cached)
+	// messages so that only the new turns are sent in the Gemini request body.
+	messages := openAIReq.Messages
+	if o.pendingCacheResult != nil && o.pendingCacheResult.FilteredMessages != nil {
+		messages = o.pendingCacheResult.FilteredMessages
+	}
+
 	// Convert OpenAI messages to Gemini Contents and SystemInstruction.
-	contents, systemInstruction, err := openAIMessagesToGeminiContents(openAIReq.Messages, requestModel)
+	contents, systemInstruction, err := openAIMessagesToGeminiContents(messages, requestModel)
 	if err != nil {
 		return nil, err
 	}
@@ -564,6 +595,13 @@ func (o *openAIToGCPVertexAITranslatorV1ChatCompletion) openAIMessageToGeminiMes
 	// Apply vendor-specific fields after standard OpenAI-to-Gemini translation.
 	// Vendor fields take precedence over translated fields when conflicts occur.
 	o.applyVendorSpecificFields(openAIReq, &gcr, requestModel)
+
+	// Inject resolved cache name from the context-cache resolver (set via SetGCPCacheResult).
+	// This happens after vendor-field processing so an explicit vendor cachedContent still wins
+	// (the validation in RequestBody already rejected the mixed case).
+	if o.pendingCacheResult != nil && gcr.CachedContent == "" {
+		gcr.CachedContent = o.pendingCacheResult.CacheName
+	}
 
 	return &gcr, nil
 }
@@ -635,6 +673,14 @@ func (o *openAIToGCPVertexAITranslatorV1ChatCompletion) applyVendorSpecificField
 	if gcpVendorFields.CachedContent != "" {
 		gcr.CachedContent = gcpVendorFields.CachedContent
 	}
+}
+
+// SetGCPCacheResult implements [GCPCacheSetter]. The upstream processor calls this
+// before RequestBody when the context-cache resolver has resolved or created a cache entry.
+// The stored result is consumed in openAIMessageToGeminiMessage (to inject cachedContent
+// and replace the message list) and cleared after use so retries start fresh.
+func (o *openAIToGCPVertexAITranslatorV1ChatCompletion) SetGCPCacheResult(result *GCPCacheResult) {
+	o.pendingCacheResult = result
 }
 
 func (o *openAIToGCPVertexAITranslatorV1ChatCompletion) geminiResponseToOpenAIMessage(gcr *genai.GenerateContentResponse, responseModel string) (*openai.ChatCompletionResponse, error) {

@@ -68,6 +68,11 @@ type RuntimeBackend struct {
 	Backend *Backend
 	// Handler is the backend auth handler.
 	Handler BackendAuthHandler
+	// CacheResolver is the in-process context-cache resolver for this backend.
+	// It is populated by the extproc layer for GCP Vertex AI backends (where Handler
+	// implements GCPAuthHandler). Held as any to avoid an import cycle between
+	// filterapi and gcpcache; callers type-assert to gcpcache.CacheResolver.
+	CacheResolver any
 }
 
 // RuntimeGlobalRequestCost is the configuration for gateway-level default request costs.

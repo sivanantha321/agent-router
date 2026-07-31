@@ -27,6 +27,7 @@ import (
 
 	"github.com/envoyproxy/ai-gateway/internal/backendauth"
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
+	"github.com/envoyproxy/ai-gateway/internal/gcpcache"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 	"github.com/envoyproxy/ai-gateway/internal/redaction"
 )
@@ -83,6 +84,15 @@ func (s *Server) LoadConfig(ctx context.Context, config *filterapi.Config) error
 	if err != nil {
 		return fmt.Errorf("cannot create runtime filter config: %w", err)
 	}
+
+	// Attach a shared in-process context-cache resolver for each GCP Vertex AI backend.
+	// The resolver is reused across requests so the in-memory TTL memo is preserved.
+	for _, rb := range newConfig.Backends {
+		if _, ok := rb.Handler.(filterapi.GCPAuthHandler); ok {
+			rb.CacheResolver = gcpcache.New(nil)
+		}
+	}
+
 	s.config = newConfig // This is racey, but we don't care.
 	return nil
 }
