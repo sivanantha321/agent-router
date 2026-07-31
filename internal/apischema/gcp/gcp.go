@@ -39,6 +39,11 @@ type GenerateContentRequest struct {
 	//
 	// https://github.com/googleapis/go-genai/blob/6a8184fcaf8bf15f0c566616a7b356560309be9b/types.go#L1057
 	SafetySettings []*genai.SafetySetting `json:"safetySettings,omitempty"`
+	// Optional. The name of a pre-existing cached content resource to use as context for generation.
+	// Format: "projects/{project}/locations/{location}/cachedContents/{cache_id}"
+	//
+	// https://cloud.google.com/vertex-ai/docs/context-cache/context-cache-overview
+	CachedContent string `json:"cachedContent,omitempty"`
 }
 
 // https://docs.cloud.google.com/vertex-ai/generative-ai/docs/model-reference/text-embeddings-api#syntax

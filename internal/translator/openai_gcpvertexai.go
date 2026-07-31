@@ -105,6 +105,12 @@ func (o *openAIToGCPVertexAITranslatorV1ChatCompletion) RequestBody(_ []byte, op
 		o.requestModel = o.modelNameOverride
 	}
 
+	// Validate that explicit cachedContent and cache_control markers are not used together.
+	if openAIReq.GCPVertexAIVendorFields != nil && openAIReq.CachedContent != "" &&
+		gcpRequestHasCacheControlMarkers(openAIReq) {
+		return nil, nil, fmt.Errorf("%w: cannot specify both cache_control on messages and explicit cachedContent field", internalapi.ErrMalformedRequest)
+	}
+
 	// Set streaming flag.
 	o.stream = openAIReq.Stream
 
@@ -562,6 +568,48 @@ func (o *openAIToGCPVertexAITranslatorV1ChatCompletion) openAIMessageToGeminiMes
 	return &gcr, nil
 }
 
+// gcpRequestHasCacheControlMarkers returns true if any message content part in the request
+// contains a cache_control marker (Anthropic-style ephemeral cache breakpoint).
+func gcpRequestHasCacheControlMarkers(openAIReq *openai.ChatCompletionRequest) bool {
+	for i := range openAIReq.Messages {
+		msg := &openAIReq.Messages[i]
+		// Check tool messages (AnthropicContentFields inline on message itself).
+		if msg.OfTool != nil && msg.OfTool.AnthropicContentFields != nil &&
+			isCacheEnabled(msg.OfTool.AnthropicContentFields) {
+			return true
+		}
+		// Check system messages (content is ContentUnion — []ChatCompletionContentPartTextParam or string).
+		if msg.OfSystem != nil {
+			if parts, ok := msg.OfSystem.Content.Value.([]openai.ChatCompletionContentPartTextParam); ok {
+				for j := range parts {
+					if isCacheEnabled(parts[j].AnthropicContentFields) {
+						return true
+					}
+				}
+			}
+		}
+		// Check user messages (content is StringOrUserRoleContentUnion —
+		// []ChatCompletionContentPartUserUnionParam or string).
+		if msg.OfUser != nil {
+			if parts, ok := msg.OfUser.Content.Value.([]openai.ChatCompletionContentPartUserUnionParam); ok {
+				for j := range parts {
+					part := &parts[j]
+					if part.OfText != nil && isCacheEnabled(part.OfText.AnthropicContentFields) {
+						return true
+					}
+					if part.OfImageURL != nil && isCacheEnabled(part.OfImageURL.AnthropicContentFields) {
+						return true
+					}
+					if part.OfInputAudio != nil && isCacheEnabled(part.OfInputAudio.AnthropicContentFields) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
 // applyVendorSpecificFields applies GCP Vertex AI vendor-specific fields to the Gemini request.
 // These fields allow users to access advanced GCP-specific features not available in the OpenAI API.
 // Vendor fields override any conflicting fields that were set during the standard translation process.
@@ -583,6 +631,9 @@ func (o *openAIToGCPVertexAITranslatorV1ChatCompletion) applyVendorSpecificField
 	}
 	if gcpVendorFields.SafetySettings != nil {
 		gcr.SafetySettings = gcpVendorFields.SafetySettings
+	}
+	if gcpVendorFields.CachedContent != "" {
+		gcr.CachedContent = gcpVendorFields.CachedContent
 	}
 }
 
