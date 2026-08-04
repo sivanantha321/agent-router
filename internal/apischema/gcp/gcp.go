@@ -42,7 +42,7 @@ type GenerateContentRequest struct {
 	// Optional. The name of a pre-existing cached content resource to use as context for generation.
 	// Format: "projects/{project}/locations/{location}/cachedContents/{cache_id}"
 	//
-	// https://cloud.google.com/vertex-ai/docs/context-cache/context-cache-overview
+	// https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/context-cache/context-cache-overview
 	CachedContent string `json:"cachedContent,omitempty"`
 }
 
