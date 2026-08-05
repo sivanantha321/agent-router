@@ -32,6 +32,7 @@ import (
 
 	"google.golang.org/genai"
 
+	"github.com/envoyproxy/ai-gateway/internal/apischema/gcp"
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
 	"github.com/envoyproxy/ai-gateway/internal/json"
@@ -111,27 +112,27 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 		return nil, nil
 	}
 
-	// Split: cached prefix = messages[0:breakpoint+1], remainder = messages[breakpoint+1:].
+	// Split cached prefix.
 	cachedMessages := openAIReq.Messages[:breakpoint+1]
 	remainderMessages := openAIReq.Messages[breakpoint+1:]
 
-	// Extract the TTL from the breakpoint message (fall back to default).
+	// Extract the TTL from the breakpoint message. If not found, fall back to default.
 	ttl := extractTTL(openAIReq.Messages[breakpoint])
 
 	// Build the Gemini cached prefix (tools + system + contents).
 	contents, systemInstruction, err := translator.OpenAIMessagesToGeminiContents(cachedMessages, openAIReq.Model)
 	if err != nil {
-		return nil, fmt.Errorf("gcpcache: converting cached messages to Gemini format: %w", err)
+		return nil, fmt.Errorf("gcpcache: failed to convert cached messages to Gemini format: %w", err)
 	}
 	geminiTools, err := translator.OpenAIToolsToGeminiTools(openAIReq.Tools, false)
 	if err != nil {
-		return nil, fmt.Errorf("gcpcache: converting tools to Gemini format: %w", err)
+		return nil, fmt.Errorf("gcpcache: failed to convert tools to Gemini format: %w", err)
 	}
 
 	// Compute a deterministic cache key.
 	cacheKey, err := computeCacheKey(openAIReq.Model, contents, systemInstruction, geminiTools)
 	if err != nil {
-		return nil, fmt.Errorf("gcpcache: computing cache key: %w", err)
+		return nil, fmt.Errorf("gcpcache: failed to compute cache key: %w", err)
 	}
 
 	// Check in-memory memo first.
@@ -147,15 +148,15 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 	tokenSrc := gcpAuth.GCPTokenSource()
 	token, err := tokenSrc.Token()
 	if err != nil {
-		return nil, fmt.Errorf("gcpcache: getting GCP access token: %w", err)
+		return nil, fmt.Errorf("gcpcache: failed to get GCP access token: %w", err)
 	}
 	accessToken := token.AccessToken
 
-	// List existing caches and match by displayName (= cacheKey).
+	// List existing caches and match by displayName (cacheKey).
 	baseURL := fmt.Sprintf(gcpCachedContentsBasePath, region, project, region)
 	existingName, expireTime, err := r.listAndMatch(ctx, baseURL, accessToken, cacheKey, openAIReq.Model)
 	if err != nil {
-		return nil, fmt.Errorf("gcpcache: listing cached contents: %w", err)
+		return nil, fmt.Errorf("gcpcache: failed to list cached contents: %w", err)
 	}
 
 	if existingName != "" {
@@ -170,7 +171,7 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 	// Cache not found — create it.
 	created, tokenCount, expireTime, err := r.createCache(ctx, baseURL, accessToken, openAIReq.Model, region, project, cacheKey, contents, systemInstruction, geminiTools, ttl)
 	if err != nil {
-		return nil, fmt.Errorf("gcpcache: creating cached content: %w", err)
+		return nil, fmt.Errorf("gcpcache: failed to create cached content: %w", err)
 	}
 
 	// After create, re-list and prefer the oldest match to converge duplicate-create races.
@@ -308,8 +309,7 @@ func anthropicTTLToGCP(ttl string) string {
 	}
 }
 
-// computeKeyInputs converts the cached message prefix into Gemini format for key generation.
-// It is separated from Resolve so tests can reproduce the same key deterministically.
+// computeKeyInputs converts a cached message prefix into Gemini format for key generation.
 func computeKeyInputs(model string, cachedMessages []openai.ChatCompletionMessageParamUnion) ([]genai.Content, *genai.Content, error) {
 	contents, sys, err := translator.OpenAIMessagesToGeminiContents(cachedMessages, model)
 	if err != nil {
@@ -341,7 +341,7 @@ func computeCacheKey(model string, contents []genai.Content, systemInstruction *
 	}
 	b, err := json.Marshal(input)
 	if err != nil {
-		return "", fmt.Errorf("marshaling cache key input: %w", err)
+		return "", fmt.Errorf("failed to marshal cache key input: %w", err)
 	}
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:]), nil
@@ -413,7 +413,7 @@ func (r *resolver) listAndMatch(ctx context.Context, baseURL, accessToken, cache
 
 	var lr listResponse
 	if err = json.Unmarshal(body, &lr); err != nil {
-		return "", time.Time{}, fmt.Errorf("decoding list response: %w", err)
+		return "", time.Time{}, fmt.Errorf("failed to decode list response: %w", err)
 	}
 
 	for _, item := range lr.CachedContents {
@@ -440,28 +440,7 @@ func modelMatchesSuffix(fullModel, shortModel string) bool {
 	return len(fullModel) >= len(suffix) && fullModel[len(fullModel)-len(suffix):] == suffix
 }
 
-// createCacheRequest is the request body for POST .../cachedContents.
-type createCacheRequest struct {
-	Model             string          `json:"model"`
-	Contents          []genai.Content `json:"contents"`
-	SystemInstruction *genai.Content  `json:"systemInstruction,omitempty"`
-	Tools             []genai.Tool    `json:"tools,omitempty"`
-	DisplayName       string          `json:"displayName"`
-	TTL               string          `json:"ttl"`
-}
-
-// createCacheResponse is the subset of the create response we read.
-type createCacheResponse struct {
-	Name          string              `json:"name"`
-	ExpireTime    string              `json:"expireTime"`
-	UsageMetadata *cacheUsageMetadata `json:"usageMetadata,omitempty"`
-}
-
-type cacheUsageMetadata struct {
-	TotalTokenCount int `json:"totalTokenCount"`
-}
-
-// createCache calls POST .../cachedContents and returns the new cache's resource name,
+// createCache creates a cached content in GCP and returns the new cache's resource name,
 // token count, and expiry time.
 func (r *resolver) createCache(
 	ctx context.Context,
@@ -474,7 +453,7 @@ func (r *resolver) createCache(
 	// Vertex AI expects the full model resource name.
 	fullModel := fmt.Sprintf("projects/%s/locations/%s/publishers/google/models/%s", project, region, model)
 
-	body := createCacheRequest{
+	body := gcp.CreateCachedContent{
 		Model:             fullModel,
 		Contents:          contents,
 		SystemInstruction: systemInstruction,
@@ -484,7 +463,7 @@ func (r *resolver) createCache(
 	}
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-		return "", 0, time.Time{}, fmt.Errorf("marshaling create request: %w", err)
+		return "", 0, time.Time{}, fmt.Errorf("failed to marshal create cache request body: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL, bytes.NewReader(bodyBytes))
@@ -507,14 +486,13 @@ func (r *resolver) createCache(
 		return "", 0, time.Time{}, fmt.Errorf("create cachedContent returned HTTP %d: %s", resp.StatusCode, respBody)
 	}
 
-	var cr createCacheResponse
+	var cr gcp.CachedContent
 	if err = json.Unmarshal(respBody, &cr); err != nil {
-		return "", 0, time.Time{}, fmt.Errorf("decoding create response: %w", err)
+		return "", 0, time.Time{}, fmt.Errorf("failed to decode create cache response: %w", err)
 	}
 
-	expireTime, _ = time.Parse(time.RFC3339, cr.ExpireTime)
 	if cr.UsageMetadata != nil {
-		tokenCount = cr.UsageMetadata.TotalTokenCount
+		tokenCount = int(cr.UsageMetadata.TotalTokenCount)
 	}
-	return cr.Name, tokenCount, expireTime, nil
+	return cr.Name, tokenCount, cr.ExpireTime, nil
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
 
+	"github.com/envoyproxy/ai-gateway/internal/apischema/gcp"
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
@@ -475,7 +476,7 @@ func TestResolver_TTLDefault_SentToGoogle(t *testing.T) {
 	_, err := r.Resolve(context.Background(), req, auth)
 	require.NoError(t, err)
 
-	var body createCacheRequest
+	var body gcp.CreateCachedContent
 	require.NoError(t, json.Unmarshal(capturedBody, &body))
 	assert.Equal(t, defaultTTL, body.TTL)
 }
@@ -511,7 +512,7 @@ func TestResolver_TTLOverride_SentToGoogle(t *testing.T) {
 	_, err := r.Resolve(context.Background(), req, auth)
 	require.NoError(t, err)
 
-	var body createCacheRequest
+	var body gcp.CreateCachedContent
 	require.NoError(t, json.Unmarshal(capturedBody, &body))
 	assert.Equal(t, "3600s", body.TTL)
 }
