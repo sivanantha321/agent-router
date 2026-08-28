@@ -53,7 +53,7 @@ func TestServer_LoadConfig(t *testing.T) {
 }
 
 // TestServer_LoadConfig_GCPCacheResolver verifies that a CacheResolver is attached
-// to a GCP backend only when GCPContextCaching.Enabled is true.
+// to a GCP backend only when ContextCaching.Enabled is true.
 func TestServer_LoadConfig_GCPCacheResolver(t *testing.T) {
 	s := &Server{}
 
@@ -65,7 +65,7 @@ func TestServer_LoadConfig_GCPCacheResolver(t *testing.T) {
 				Auth: &filterapi.BackendAuth{
 					GCPAuth: &filterapi.GCPAuth{AccessToken: "token"},
 				},
-				GCPContextCaching: &filterapi.GCPContextCaching{Enabled: true, DefaultTTL: "600s"},
+				ContextCaching: &filterapi.ContextCaching{Enabled: true, DefaultTTL: "600s"},
 			},
 			{
 				Name:   "gcp-caching-off",
@@ -73,7 +73,7 @@ func TestServer_LoadConfig_GCPCacheResolver(t *testing.T) {
 				Auth: &filterapi.BackendAuth{
 					GCPAuth: &filterapi.GCPAuth{AccessToken: "token"},
 				},
-				GCPContextCaching: &filterapi.GCPContextCaching{Enabled: false},
+				ContextCaching: &filterapi.ContextCaching{Enabled: false},
 			},
 			{
 				Name:   "gcp-no-caching-field",
@@ -81,7 +81,7 @@ func TestServer_LoadConfig_GCPCacheResolver(t *testing.T) {
 				Auth: &filterapi.BackendAuth{
 					GCPAuth: &filterapi.GCPAuth{AccessToken: "token"},
 				},
-				// GCPContextCaching is nil.
+				// ContextCaching is nil.
 			},
 			{
 				Name:   "non-gcp",
@@ -95,13 +95,13 @@ func TestServer_LoadConfig_GCPCacheResolver(t *testing.T) {
 	require.NoError(t, err)
 
 	rb := s.config.Backends["gcp-caching-on"]
-	require.NotNil(t, rb.CacheResolver, "CacheResolver must be set when GCPContextCaching.Enabled=true")
+	require.NotNil(t, rb.CacheResolver, "CacheResolver must be set when ContextCaching.Enabled=true")
 
 	rb = s.config.Backends["gcp-caching-off"]
-	require.Nil(t, rb.CacheResolver, "CacheResolver must be nil when GCPContextCaching.Enabled=false")
+	require.Nil(t, rb.CacheResolver, "CacheResolver must be nil when ContextCaching.Enabled=false")
 
 	rb = s.config.Backends["gcp-no-caching-field"]
-	require.Nil(t, rb.CacheResolver, "CacheResolver must be nil when GCPContextCaching is absent")
+	require.Nil(t, rb.CacheResolver, "CacheResolver must be nil when ContextCaching is absent")
 
 	rb = s.config.Backends["non-gcp"]
 	require.Nil(t, rb.CacheResolver, "CacheResolver must be nil for non-GCP backends")
@@ -110,15 +110,15 @@ func TestServer_LoadConfig_GCPCacheResolver(t *testing.T) {
 // gcpBackendWithCaching builds a GCP backend whose context caching points at redisURL
 // (or has no redis block at all when redisURL is empty).
 func gcpBackendWithCaching(name, redisURL string) filterapi.Backend {
-	cc := &filterapi.GCPContextCaching{Enabled: true, DefaultTTL: "600s"}
+	cc := &filterapi.ContextCaching{Enabled: true, DefaultTTL: "600s"}
 	if redisURL != "" {
-		cc.Redis = &filterapi.GCPCacheRedis{URL: redisURL}
+		cc.Redis = &filterapi.CacheRedis{URL: redisURL}
 	}
 	return filterapi.Backend{
-		Name:              name,
-		Schema:            filterapi.VersionedAPISchema{Name: filterapi.APISchemaGCPVertexAI},
-		Auth:              &filterapi.BackendAuth{GCPAuth: &filterapi.GCPAuth{AccessToken: "token"}},
-		GCPContextCaching: cc,
+		Name:           name,
+		Schema:         filterapi.VersionedAPISchema{Name: filterapi.APISchemaGCPVertexAI},
+		Auth:           &filterapi.BackendAuth{GCPAuth: &filterapi.GCPAuth{AccessToken: "token"}},
+		ContextCaching: cc,
 	}
 }
 

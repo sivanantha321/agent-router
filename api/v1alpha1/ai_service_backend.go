@@ -76,20 +76,20 @@ type AIServiceBackendSpec struct {
 	// +optional
 	BodyMutation *HTTPBodyMutation `json:"bodyMutation,omitempty"`
 
-	// GCPContextCaching configures Gemini context caching for this backend.
+	// ContextCaching configures Gemini context caching for this backend.
 	// When set, the ai-gateway will automatically resolve or create a Google cachedContents
 	// entry for requests that carry Anthropic-style cache_control markers, and inject the
 	// resolved cache resource name into the Gemini API request.
 	// This field is only meaningful for GCPVertexAI backends.
 	// +optional
-	GCPContextCaching *GCPContextCachingSpec `json:"gcpContextCaching,omitempty"`
+	ContextCaching *ContextCachingSpec `json:"contextCaching,omitempty"`
 
 	// TODO: maybe add backend-level LLMRequestCost configuration that overrides the AIGatewayRoute-level LLMRequestCost.
 	// 	That may be useful for the backend that has a different cost calculation logic.
 }
 
-// GCPContextCachingSpec configures Gemini context caching for a GCP Vertex AI backend.
-type GCPContextCachingSpec struct {
+// ContextCachingSpec configures Gemini context caching for a GCP Vertex AI backend.
+type ContextCachingSpec struct {
 	// Enabled controls whether context caching is active for this backend.
 	// When false, cache_control markers in requests are ignored and no cachedContents
 	// API calls are made.
@@ -117,11 +117,11 @@ type GCPContextCachingSpec struct {
 	// served uncached rather than failed.
 	//
 	// +optional
-	Redis *GCPCacheRedisSpec `json:"redis,omitempty"`
+	Redis *CacheRedisSpec `json:"redis,omitempty"`
 }
 
-// GCPCacheRedisSpec locates the Redis instance backing the context cache store.
-type GCPCacheRedisSpec struct {
+// CacheRedisSpec locates the Redis instance backing the context cache store.
+type CacheRedisSpec struct {
 	// URL is the address of the Redis instance, given either as a bare "host:port"
 	// (e.g. "redis.default.svc.cluster.local:6379") or as a full "redis://" URL.
 	//

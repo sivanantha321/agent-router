@@ -6,7 +6,7 @@
 apiVersion: aigateway.envoyproxy.io/v1beta1
 kind: AIServiceBackend
 metadata:
-  name: gcp-cache-backend
+  name: gcp-cache-backend-bad-ttl
   namespace: default
 spec:
   schema:
@@ -16,6 +16,6 @@ spec:
     kind: Backend
     group: gateway.envoyproxy.io
     port: 443
-  gcpContextCaching:
+  contextCaching:
     enabled: true
-    defaultTTL: "600s"
+    defaultTTL: "not-a-duration"

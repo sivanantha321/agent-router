@@ -3,7 +3,7 @@
 // The full text of the Apache license is available in the LICENSE file at
 // the root of the repo.
 
-package gcpcache
+package cachestore
 
 import (
 	"context"
@@ -36,11 +36,11 @@ const (
 	lockPollInterval = 50 * time.Millisecond
 )
 
-// errLockHeld reports that another replica holds the create lock and did not publish a
+// ErrLockHeld reports that another replica holds the create lock and did not publish a
 // result before lockWaitTime elapsed.
-var errLockHeld = errors.New("gcpcache: create lock held by another replica")
+var ErrLockHeld = errors.New("cachestore: create lock held by another replica")
 
-// redisStore is a CacheStore backed by Redis, shared across gateway replicas.
+// redisStore is a Store backed by Redis, shared across gateway replicas.
 //
 // Beyond plain get/set it arbitrates cache creation: the first replica to claim a key
 // creates the Google cache while the others wait for its result, so a cold prefix
@@ -49,12 +49,12 @@ type redisStore struct {
 	client redis.UniversalClient
 }
 
-// NewRedisStore returns a CacheStore backed by the Redis instance at url, which accepts
+// NewRedisStore returns a Store backed by the Redis instance at url, which accepts
 // either a bare "host:port" or a full "redis://" URL.
 //
 // No connection is established here; go-redis dials lazily. A Redis that is unreachable
 // therefore surfaces as an error from Get/Set, which the resolver treats as a miss.
-func NewRedisStore(url string) (CacheStore, error) {
+func NewRedisStore(url string) (Store, error) {
 	opts, err := parseRedisURL(url)
 	if err != nil {
 		return nil, err
@@ -65,44 +65,44 @@ func NewRedisStore(url string) (CacheStore, error) {
 // parseRedisURL accepts both a scheme-qualified URL and a bare host:port.
 func parseRedisURL(url string) (*redis.Options, error) {
 	if url == "" {
-		return nil, errors.New("gcpcache: redis url is empty")
+		return nil, errors.New("cachestore: redis url is empty")
 	}
 	if strings.Contains(url, "://") {
 		opts, err := redis.ParseURL(url)
 		if err != nil {
-			return nil, fmt.Errorf("gcpcache: invalid redis url: %w", err)
+			return nil, fmt.Errorf("cachestore: invalid redis url: %w", err)
 		}
 		return opts, nil
 	}
 	return &redis.Options{Addr: url}, nil
 }
 
-// Get implements CacheStore. A key holding the create sentinel is reported as a miss,
+// Get implements Store. A key holding the create sentinel is reported as a miss,
 // since no cache name is available yet.
-func (s *redisStore) Get(ctx context.Context, key string) (entry, bool, error) {
+func (s *redisStore) Get(ctx context.Context, key string) (Entry, bool, error) {
 	v, err := s.client.Get(ctx, key).Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			return entry{}, false, nil
+			return Entry{}, false, nil
 		}
-		return entry{}, false, fmt.Errorf("gcpcache: redis get: %w", err)
+		return Entry{}, false, fmt.Errorf("cachestore: redis get: %w", err)
 	}
 	if v == lockSentinel {
-		return entry{}, false, nil
+		return Entry{}, false, nil
 	}
 	e, err := decodeEntry(v)
 	if err != nil {
 		// A malformed value is treated as a miss rather than an error: it is not worth
 		// failing a resolution over, and the next write will overwrite it.
-		return entry{}, false, nil
+		return Entry{}, false, nil
 	}
 	return e, true, nil
 }
 
-// Set implements CacheStore.
-func (s *redisStore) Set(ctx context.Context, key string, e entry, ttl time.Duration) error {
+// Set implements Store.
+func (s *redisStore) Set(ctx context.Context, key string, e Entry, ttl time.Duration) error {
 	if err := s.client.Set(ctx, key, encodeEntry(e), ttl).Err(); err != nil {
-		return fmt.Errorf("gcpcache: redis set: %w", err)
+		return fmt.Errorf("cachestore: redis set: %w", err)
 	}
 	return nil
 }
@@ -111,10 +111,10 @@ func (s *redisStore) Set(ctx context.Context, key string, e entry, ttl time.Dura
 //
 // The winner must publish its result with Set (or release the claim with unlock) so that
 // waiters are not stuck until the lock expires.
-func (s *redisStore) tryLock(ctx context.Context, key string) (bool, error) {
+func (s *redisStore) TryLock(ctx context.Context, key string) (bool, error) {
 	won, err := s.client.SetNX(ctx, key, lockSentinel, lockTTL).Result()
 	if err != nil {
-		return false, fmt.Errorf("gcpcache: redis lock: %w", err)
+		return false, fmt.Errorf("cachestore: redis lock: %w", err)
 	}
 	return won, nil
 }
@@ -124,19 +124,19 @@ func (s *redisStore) tryLock(ctx context.Context, key string) (bool, error) {
 //
 // It deletes only a key still holding the sentinel: if a create succeeded and published a
 // real name, or the lock expired and another replica re-claimed it, the key is left alone.
-func (s *redisStore) unlock(ctx context.Context, key string) {
+func (s *redisStore) Unlock(ctx context.Context, key string) {
 	const script = `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) end return 0`
 	// Best-effort: a failure here only means waiters fall back to Google after lockWaitTime.
 	_ = s.client.Eval(ctx, script, []string{key}, lockSentinel).Err()
 }
 
-// awaitLeader polls key until the leader publishes a cache name, the claim disappears, or
+// AwaitLeader polls key until the leader publishes a cache name, the claim disappears, or
 // lockWaitTime elapses.
 //
-// A timeout returns errLockHeld, which the caller treats as "resolve against Google
-// yourself". That degrades a stuck leader into an extra list rather than a duplicate
-// create, since the resolver lists before it creates.
-func (s *redisStore) awaitLeader(ctx context.Context, key string) (entry, bool, error) {
+// A timeout returns ErrLockHeld, which the caller treats as "resolve against the provider
+// yourself". That degrades a stuck leader into an extra lookup rather than a duplicate
+// create, provided the caller checks the provider before creating.
+func (s *redisStore) AwaitLeader(ctx context.Context, key string) (Entry, bool, error) {
 	deadline := time.NewTimer(lockWaitTime)
 	defer deadline.Stop()
 	ticker := time.NewTicker(lockPollInterval)
@@ -145,46 +145,49 @@ func (s *redisStore) awaitLeader(ctx context.Context, key string) (entry, bool, 
 	for {
 		select {
 		case <-ctx.Done():
-			return entry{}, false, ctx.Err()
+			return Entry{}, false, ctx.Err()
 		case <-deadline.C:
-			return entry{}, false, errLockHeld
+			return Entry{}, false, ErrLockHeld
 		case <-ticker.C:
 			v, err := s.client.Get(ctx, key).Result()
 			if err != nil {
 				if errors.Is(err, redis.Nil) {
 					// The leader released the lock without publishing; caller should resolve.
-					return entry{}, false, errLockHeld
+					return Entry{}, false, ErrLockHeld
 				}
-				return entry{}, false, fmt.Errorf("gcpcache: redis get failed: %w", err)
+				return Entry{}, false, fmt.Errorf("cachestore: redis get failed: %w", err)
 			}
 			if v == lockSentinel {
 				continue // Still creating.
 			}
 			e, decErr := decodeEntry(v)
 			if decErr != nil {
-				return entry{}, false, errLockHeld
+				return Entry{}, false, ErrLockHeld
 			}
 			return e, true, nil
 		}
 	}
 }
 
-// encodeEntry serializes an entry as "<RFC3339 expiry>|<cache name>". The cache name is
+// encodeEntry serializes an Entry as "<RFC3339 expiry>|<cache name>". The cache name is
 // last because it is the only field that may itself contain the separator.
-func encodeEntry(e entry) string {
-	return e.expireTime.UTC().Format(time.RFC3339) + "|" + e.cacheName
+func encodeEntry(e Entry) string {
+	return e.ExpireTime.UTC().Format(time.RFC3339) + "|" + e.CacheName
 }
 
-func decodeEntry(s string) (entry, error) {
+func decodeEntry(s string) (Entry, error) {
 	expiry, name, ok := strings.Cut(s, "|")
 	if !ok || name == "" {
-		return entry{}, fmt.Errorf("gcpcache: malformed cache entry %q", s)
+		return Entry{}, fmt.Errorf("cachestore: malformed cache Entry %q", s)
 	}
 	t, err := time.Parse(time.RFC3339, expiry)
 	if err != nil {
-		return entry{}, fmt.Errorf("gcpcache: malformed cache entry expiry %q: %w", expiry, err)
+		return Entry{}, fmt.Errorf("cachestore: malformed cache Entry expiry %q: %w", expiry, err)
 	}
-	return entry{cacheName: name, expireTime: t}, nil
+	return Entry{CacheName: name, ExpireTime: t}, nil
 }
 
-var _ CacheStore = (*redisStore)(nil)
+var (
+	_ Store  = (*redisStore)(nil)
+	_ Locker = (*redisStore)(nil)
+)

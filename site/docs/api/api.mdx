@@ -579,8 +579,8 @@ QuotaPolicyList contains a list of QuotaPolicy
 - [BackendSecurityPolicySpec](#github-com-envoyproxy-ai-gateway-api-v1alpha1-backendsecuritypolicyspec)
 - [BackendSecurityPolicyStatus](#github-com-envoyproxy-ai-gateway-api-v1alpha1-backendsecuritypolicystatus)
 - [BackendSecurityPolicyType](#github-com-envoyproxy-ai-gateway-api-v1alpha1-backendsecuritypolicytype)
-- [GCPCacheRedisSpec](#github-com-envoyproxy-ai-gateway-api-v1alpha1-gcpcacheredisspec)
-- [GCPContextCachingSpec](#github-com-envoyproxy-ai-gateway-api-v1alpha1-gcpcontextcachingspec)
+- [CacheRedisSpec](#github-com-envoyproxy-ai-gateway-api-v1alpha1-cacheredisspec)
+- [ContextCachingSpec](#github-com-envoyproxy-ai-gateway-api-v1alpha1-contextcachingspec)
 - [GCPCredentialsFile](#github-com-envoyproxy-ai-gateway-api-v1alpha1-gcpcredentialsfile)
 - [GCPOIDCExchangeToken](#github-com-envoyproxy-ai-gateway-api-v1alpha1-gcpoidcexchangetoken)
 - [GCPServiceAccountImpersonationConfig](#github-com-envoyproxy-ai-gateway-api-v1alpha1-gcpserviceaccountimpersonationconfig)
@@ -851,10 +851,10 @@ AIServiceBackendSpec details the AIServiceBackend configuration.
   required="false"
   description="BodyMutation defines the mutation of HTTP request body JSON fields that will be applied to the request<br />before sending it to the backend."
 /><ApiField
-  name="gcpContextCaching"
-  type="[GCPContextCachingSpec](#github-com-envoyproxy-ai-gateway-api-v1alpha1-gcpcontextcachingspec)"
+  name="contextCaching"
+  type="[ContextCachingSpec](#github-com-envoyproxy-ai-gateway-api-v1alpha1-contextcachingspec)"
   required="false"
-  description="GCPContextCaching configures Gemini context caching for this backend.<br />When set, the ai-gateway will automatically resolve or create a Google cachedContents<br />entry for requests that carry Anthropic-style cache_control markers, and inject the<br />resolved cache resource name into the Gemini API request.<br />This field is only meaningful for GCPVertexAI backends."
+  description="ContextCaching configures Gemini context caching for this backend.<br />When set, the ai-gateway will automatically resolve or create a Google cachedContents<br />entry for requests that carry Anthropic-style cache_control markers, and inject the<br />resolved cache resource name into the Gemini API request.<br />This field is only meaningful for GCPVertexAI backends."
 />
 
 
@@ -1370,14 +1370,14 @@ BackendSecurityPolicyType specifies the type of auth mechanism used to access a 
   required="false"
   description=""
 />
-#### <a id="github-com-envoyproxy-ai-gateway-api-v1alpha1-gcpcacheredisspec">GCPCacheRedisSpec</a>
+#### <a id="github-com-envoyproxy-ai-gateway-api-v1alpha1-cacheredisspec">CacheRedisSpec</a>
 
 
 
 **Appears in:**
-- [GCPContextCachingSpec](#github-com-envoyproxy-ai-gateway-api-v1alpha1-gcpcontextcachingspec)
+- [ContextCachingSpec](#github-com-envoyproxy-ai-gateway-api-v1alpha1-contextcachingspec)
 
-GCPCacheRedisSpec locates the Redis instance backing the context cache store.
+CacheRedisSpec locates the Redis instance backing the context cache store.
 
 ##### Fields
 
@@ -1391,14 +1391,14 @@ GCPCacheRedisSpec locates the Redis instance backing the context cache store.
 />
 
 
-#### <a id="github-com-envoyproxy-ai-gateway-api-v1alpha1-gcpcontextcachingspec">GCPContextCachingSpec</a>
+#### <a id="github-com-envoyproxy-ai-gateway-api-v1alpha1-contextcachingspec">ContextCachingSpec</a>
 
 
 
 **Appears in:**
 - [AIServiceBackendSpec](#github-com-envoyproxy-ai-gateway-api-v1alpha1-aiservicebackendspec)
 
-GCPContextCachingSpec configures Gemini context caching for a GCP Vertex AI backend.
+ContextCachingSpec configures Gemini context caching for a GCP Vertex AI backend.
 
 ##### Fields
 
@@ -1416,7 +1416,7 @@ GCPContextCachingSpec configures Gemini context caching for a GCP Vertex AI back
   description="DefaultTTL is the default time-to-live for newly created cache entries, expressed<br />as a GCP duration string (e.g. `600s`). When empty, the default of 300s is used.<br />Must be at least `60s` per GCP API requirements."
 /><ApiField
   name="redis"
-  type="[GCPCacheRedisSpec](#github-com-envoyproxy-ai-gateway-api-v1alpha1-gcpcacheredisspec)"
+  type="[CacheRedisSpec](#github-com-envoyproxy-ai-gateway-api-v1alpha1-cacheredisspec)"
   required="false"
   description="Redis identifies the shared store that records which cachedContents entry a given<br />request prefix resolved to. Sharing that state across gateway replicas is what<br />prevents two replicas from independently creating a cache for the same prefix.<br />When omitted, context caching is inert: cache_control markers are still parsed,<br />but no cache is resolved or created and requests are served uncached. Setting<br />enabled: true without a redis block is therefore valid and silently does nothing.<br />If Redis is unreachable at request time, caching is skipped and the request is<br />served uncached rather than failed."
 />
@@ -3104,10 +3104,10 @@ MCPRouteList contains a list of MCPRoute.
 - [BackendSecurityPolicySpec](#github-com-envoyproxy-ai-gateway-api-v1beta1-backendsecuritypolicyspec)
 - [BackendSecurityPolicyStatus](#github-com-envoyproxy-ai-gateway-api-v1beta1-backendsecuritypolicystatus)
 - [BackendSecurityPolicyType](#github-com-envoyproxy-ai-gateway-api-v1beta1-backendsecuritypolicytype)
+- [CacheRedisSpec](#github-com-envoyproxy-ai-gateway-api-v1beta1-cacheredisspec)
+- [ContextCachingSpec](#github-com-envoyproxy-ai-gateway-api-v1beta1-contextcachingspec)
 - [CredentialOverrideFromDynamicMetadata](#github-com-envoyproxy-ai-gateway-api-v1beta1-credentialoverridefromdynamicmetadata)
 - [CredentialOverrideFromRequestHeaders](#github-com-envoyproxy-ai-gateway-api-v1beta1-credentialoverridefromrequestheaders)
-- [GCPCacheRedisSpec](#github-com-envoyproxy-ai-gateway-api-v1beta1-gcpcacheredisspec)
-- [GCPContextCachingSpec](#github-com-envoyproxy-ai-gateway-api-v1beta1-gcpcontextcachingspec)
 - [GCPCredentialsFile](#github-com-envoyproxy-ai-gateway-api-v1beta1-gcpcredentialsfile)
 - [GCPOIDCExchangeToken](#github-com-envoyproxy-ai-gateway-api-v1beta1-gcpoidcexchangetoken)
 - [GCPServiceAccountImpersonationConfig](#github-com-envoyproxy-ai-gateway-api-v1beta1-gcpserviceaccountimpersonationconfig)
@@ -3370,10 +3370,10 @@ AIServiceBackendSpec details the AIServiceBackend configuration.
   required="false"
   description="BodyMutation defines the mutation of HTTP request body JSON fields that will be applied to the request<br />before sending it to the backend."
 /><ApiField
-  name="gcpContextCaching"
-  type="[GCPContextCachingSpec](#github-com-envoyproxy-ai-gateway-api-v1beta1-gcpcontextcachingspec)"
+  name="contextCaching"
+  type="[ContextCachingSpec](#github-com-envoyproxy-ai-gateway-api-v1beta1-contextcachingspec)"
   required="false"
-  description="GCPContextCaching configures Gemini context caching for this backend.<br />When set, the ai-gateway will automatically resolve or create a Google cachedContents<br />entry for requests that carry Anthropic-style cache_control markers, and inject the<br />resolved cache resource name into the Gemini API request.<br />This field is only meaningful for GCPVertexAI backends."
+  description="ContextCaching configures Gemini context caching for this backend.<br />When set, the ai-gateway will automatically resolve or create a Google cachedContents<br />entry for requests that carry Anthropic-style cache_control markers, and inject the<br />resolved cache resource name into the Gemini API request.<br />This field is only meaningful for GCPVertexAI backends."
 />
 
 
@@ -3927,6 +3927,58 @@ BackendSecurityPolicyType specifies the type of auth mechanism used to access a 
   required="false"
   description=""
 />
+#### <a id="github-com-envoyproxy-ai-gateway-api-v1beta1-cacheredisspec">CacheRedisSpec</a>
+
+
+
+**Appears in:**
+- [ContextCachingSpec](#github-com-envoyproxy-ai-gateway-api-v1beta1-contextcachingspec)
+
+CacheRedisSpec locates the Redis instance backing the context cache store.
+
+##### Fields
+
+
+
+<ApiField
+  name="url"
+  type="string"
+  required="true"
+  description="URL is the address of the Redis instance, given either as a bare `host:port`<br />(e.g. `redis.default.svc.cluster.local:6379`) or as a full `redis://` URL."
+/>
+
+
+#### <a id="github-com-envoyproxy-ai-gateway-api-v1beta1-contextcachingspec">ContextCachingSpec</a>
+
+
+
+**Appears in:**
+- [AIServiceBackendSpec](#github-com-envoyproxy-ai-gateway-api-v1beta1-aiservicebackendspec)
+
+ContextCachingSpec configures Gemini context caching for a GCP Vertex AI backend.
+
+##### Fields
+
+
+
+<ApiField
+  name="enabled"
+  type="boolean"
+  required="true"
+  description="Enabled controls whether context caching is active for this backend.<br />When false, cache_control markers in requests are ignored and no cachedContents<br />API calls are made."
+/><ApiField
+  name="defaultTTL"
+  type="string"
+  required="false"
+  description="DefaultTTL is the default time-to-live for newly created cache entries, expressed<br />as a GCP duration string (e.g. `600s`). When empty, the default of 300s is used.<br />Must be at least `60s` per GCP API requirements."
+/><ApiField
+  name="redis"
+  type="[CacheRedisSpec](#github-com-envoyproxy-ai-gateway-api-v1beta1-cacheredisspec)"
+  required="false"
+  description="Redis identifies the shared store that records which cachedContents entry a given<br />request prefix resolved to. Sharing that state across gateway replicas is what<br />prevents two replicas from independently creating a cache for the same prefix.<br />When omitted, context caching is inert: cache_control markers are still parsed,<br />but no cache is resolved or created and requests are served uncached. Setting<br />enabled: true without a redis block is therefore valid and silently does nothing.<br />If Redis is unreachable at request time, caching is skipped and the request is<br />served uncached rather than failed."
+/>
+
+
 #### <a id="github-com-envoyproxy-ai-gateway-api-v1beta1-credentialoverridefromdynamicmetadata">CredentialOverrideFromDynamicMetadata</a>
 
 
@@ -3984,58 +4036,6 @@ CredentialOverrideFromRequestHeaders sources the per-request credential from a r
   required="false"
   defaultValue="true"
   description="FallbackToConfigured controls behaviour when the header is absent.<br />true (default) falls back to the static credential configured in the policy.<br />false returns a 401 to the client without forwarding the request."
-/>
-
-
-#### <a id="github-com-envoyproxy-ai-gateway-api-v1beta1-gcpcacheredisspec">GCPCacheRedisSpec</a>
-
-
-
-**Appears in:**
-- [GCPContextCachingSpec](#github-com-envoyproxy-ai-gateway-api-v1beta1-gcpcontextcachingspec)
-
-GCPCacheRedisSpec locates the Redis instance backing the context cache store.
-
-##### Fields
-
-
-
-<ApiField
-  name="url"
-  type="string"
-  required="true"
-  description="URL is the address of the Redis instance, given either as a bare `host:port`<br />(e.g. `redis.default.svc.cluster.local:6379`) or as a full `redis://` URL."
-/>
-
-
-#### <a id="github-com-envoyproxy-ai-gateway-api-v1beta1-gcpcontextcachingspec">GCPContextCachingSpec</a>
-
-
-
-**Appears in:**
-- [AIServiceBackendSpec](#github-com-envoyproxy-ai-gateway-api-v1beta1-aiservicebackendspec)
-
-GCPContextCachingSpec configures Gemini context caching for a GCP Vertex AI backend.
-
-##### Fields
-
-
-
-<ApiField
-  name="enabled"
-  type="boolean"
-  required="true"
-  description="Enabled controls whether context caching is active for this backend.<br />When false, cache_control markers in requests are ignored and no cachedContents<br />API calls are made."
-/><ApiField
-  name="defaultTTL"
-  type="string"
-  required="false"
-  description="DefaultTTL is the default time-to-live for newly created cache entries, expressed<br />as a GCP duration string (e.g. `600s`). When empty, the default of 300s is used.<br />Must be at least `60s` per GCP API requirements."
-/><ApiField
-  name="redis"
-  type="[GCPCacheRedisSpec](#github-com-envoyproxy-ai-gateway-api-v1beta1-gcpcacheredisspec)"
-  required="false"
-  description="Redis identifies the shared store that records which cachedContents entry a given<br />request prefix resolved to. Sharing that state across gateway replicas is what<br />prevents two replicas from independently creating a cache for the same prefix.<br />When omitted, context caching is inert: cache_control markers are still parsed,<br />but no cache is resolved or created and requests are served uncached. Setting<br />enabled: true without a redis block is therefore valid and silently does nothing.<br />If Redis is unreachable at request time, caching is skipped and the request is<br />served uncached rather than failed."
 />
 
 

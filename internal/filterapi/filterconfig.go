@@ -197,14 +197,14 @@ type Backend struct {
 	HeaderMutation *HTTPHeaderMutation `json:"httpHeaderMutation,omitempty"`
 	// Body mutations to be applied to the request before sending to the backend. Optional.
 	BodyMutation *HTTPBodyMutation `json:"httpBodyMutation,omitempty"`
-	// GCPContextCaching configures Gemini context caching for this backend. Optional.
+	// ContextCaching configures Gemini context caching for this backend. Optional.
 	// When non-nil and Enabled is true, the extproc will resolve or create a Google
 	// cachedContents entry for requests that carry cache_control markers.
-	GCPContextCaching *GCPContextCaching `json:"gcpContextCaching,omitempty"`
+	ContextCaching *ContextCaching `json:"contextCaching,omitempty"`
 }
 
-// GCPContextCaching configures in-process Gemini context caching for a GCP Vertex AI backend.
-type GCPContextCaching struct {
+// ContextCaching configures Gemini context caching for a GCP Vertex AI backend.
+type ContextCaching struct {
 	// Enabled controls whether context caching is active for this backend.
 	// When false (or when this struct is nil), cache_control markers in requests
 	// are ignored and no cachedContents API calls are made.
@@ -221,11 +221,11 @@ type GCPContextCaching struct {
 	// resolved or created, and requests are served uncached. Enabled: true without a
 	// redis block is therefore legal and silently does nothing.
 	// +optional
-	Redis *GCPCacheRedis `json:"redis,omitempty"`
+	Redis *CacheRedis `json:"redis,omitempty"`
 }
 
-// GCPCacheRedis locates the Redis instance backing the context cache store.
-type GCPCacheRedis struct {
+// CacheRedis locates the Redis instance backing the context cache store.
+type CacheRedis struct {
 	// URL is either a bare "host:port" or a full "redis://" URL.
 	URL string `json:"url"`
 }

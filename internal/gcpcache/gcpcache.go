@@ -10,14 +10,14 @@
 //  1. Finds the last cache_control breakpoint in the message list.
 //  2. Splits the request into a cached prefix (tools + system + messages up to the breakpoint)
 //     and a non-cached remainder.
-//  3. Generates a deterministic SHA-256 cache key and looks it up in the CacheStore.
+//  3. Generates a deterministic SHA-256 cache key and looks it up in the cache store.
 //  4. On a miss, lists Google cachedContents for the target region and model.
 //  5. Creates the cache entry if not found, then returns the cache resource name and the
 //     non-cached messages.
 //
 // Duplicate creates are suppressed at two levels, because they arise from two different
 // causes. Within a replica, singleflight collapses callers that overlap in time. Across
-// replicas, the CacheStore collapses callers separated by it: it is shared, so the replica
+// replicas, the cache store collapses callers separated by it: it is shared, so the replica
 // that creates a cache publishes the result for the others, and a create lock keeps a cold
 // prefix arriving at N replicas from producing N creates. A store is not a substitute for
 // singleflight — concurrent callers all miss the shared store at the same instant.
@@ -42,6 +42,7 @@ import (
 
 	"github.com/envoyproxy/ai-gateway/internal/apischema/gcp"
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
+	"github.com/envoyproxy/ai-gateway/internal/cachestore"
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
 	"github.com/envoyproxy/ai-gateway/internal/json"
 	"github.com/envoyproxy/ai-gateway/internal/translator"
@@ -94,7 +95,7 @@ type resolver struct {
 	// store holds resolved cache names. It is shared across replicas when backed by
 	// Redis, which is what keeps two replicas from creating the same cache. Its
 	// failures are never fatal: they are logged and treated as a miss.
-	store CacheStore
+	store cachestore.Store
 
 	// logger records store failures, which are otherwise invisible because the request
 	// proceeds normally.
@@ -113,12 +114,12 @@ type resolver struct {
 // httpClient is used for calls to the Google cachedContents API; pass nil for a default.
 // store holds resolved cache names; pass nil to disable caching entirely, which makes
 // resolution inert rather than failing requests. logger may be nil.
-func New(httpClient *http.Client, store CacheStore, logger *slog.Logger) CacheResolver {
+func New(httpClient *http.Client, store cachestore.Store, logger *slog.Logger) CacheResolver {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
 	if store == nil {
-		store = noopStore{}
+		store = cachestore.NopStore{}
 	}
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
@@ -163,9 +164,9 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 	// request. Google-side failures do fail fast.
 	if e, ok := r.storeGet(ctx, cacheKey); ok {
 		return &ResolveResult{
-			CacheName:  e.cacheName,
+			CacheName:  e.CacheName,
 			Messages:   remainderMessages,
-			ExpireTime: e.expireTime,
+			ExpireTime: e.ExpireTime,
 		}, nil
 	}
 
@@ -235,7 +236,7 @@ func (r *resolver) resolveUncached(
 	locked := r.tryLock(ctx, cacheKey)
 	if !locked {
 		if e, ok := r.awaitLeader(ctx, cacheKey); ok {
-			return &ResolveResult{CacheName: e.cacheName, ExpireTime: e.expireTime}, nil
+			return &ResolveResult{CacheName: e.CacheName, ExpireTime: e.ExpireTime}, nil
 		}
 	}
 
@@ -250,7 +251,7 @@ func (r *resolver) resolveUncached(
 	}
 
 	if existingName != "" {
-		r.storeSet(ctx, cacheKey, entry{cacheName: existingName, expireTime: expireTime})
+		r.storeSet(ctx, cacheKey, cachestore.Entry{CacheName: existingName, ExpireTime: expireTime})
 		return &ResolveResult{
 			CacheName:  existingName,
 			ExpireTime: expireTime,
@@ -274,14 +275,14 @@ func (r *resolver) resolveUncached(
 	finalName, finalExpire, listErr := r.listAndMatch(ctx, baseURL, accessToken, cacheKey, openAIReq.Model)
 	if listErr == nil && finalName != "" && finalName != created {
 		// Another replica created a cache with the same key; use the one from the list.
-		r.storeSet(ctx, cacheKey, entry{cacheName: finalName, expireTime: finalExpire})
+		r.storeSet(ctx, cacheKey, cachestore.Entry{CacheName: finalName, ExpireTime: finalExpire})
 		return &ResolveResult{
 			CacheName:  finalName,
 			ExpireTime: finalExpire,
 		}, nil
 	}
 
-	r.storeSet(ctx, cacheKey, entry{cacheName: created, expireTime: expireTime})
+	r.storeSet(ctx, cacheKey, cachestore.Entry{CacheName: created, ExpireTime: expireTime})
 	return &ResolveResult{
 		CacheName:  created,
 		Created:    true,
@@ -303,28 +304,28 @@ func (r *resolver) resolveUncached(
 // -----------------------------------------------------------------------
 
 // storeGet reads a resolved cache name, reporting a miss on any failure.
-func (r *resolver) storeGet(ctx context.Context, key string) (entry, bool) {
+func (r *resolver) storeGet(ctx context.Context, key string) (cachestore.Entry, bool) {
 	e, ok, err := r.store.Get(ctx, key)
 	if err != nil {
 		r.logger.Warn("gcpcache: cache store read failed, proceeding uncached",
 			slog.String("error", err.Error()))
-		return entry{}, false
+		return cachestore.Entry{}, false
 	}
 	if !ok {
-		return entry{}, false
+		return cachestore.Entry{}, false
 	}
 	// Treat entries expiring within 10s as stale so there is time to re-resolve before
 	// the cache disappears underneath an in-flight request.
-	if time.Until(e.expireTime) < staleThreshold {
-		return entry{}, false
+	if time.Until(e.ExpireTime) < staleThreshold {
+		return cachestore.Entry{}, false
 	}
 	return e, true
 }
 
 // storeSet records a resolved cache name, expiring it with the Google entry itself so
 // the store cannot outlive what it points at.
-func (r *resolver) storeSet(ctx context.Context, key string, e entry) {
-	ttl := time.Until(e.expireTime)
+func (r *resolver) storeSet(ctx context.Context, key string, e cachestore.Entry) {
+	ttl := time.Until(e.ExpireTime)
 	if ttl <= 0 {
 		return
 	}
@@ -334,24 +335,19 @@ func (r *resolver) storeSet(ctx context.Context, key string, e entry) {
 	}
 }
 
-// locker is implemented by stores that can arbitrate cache creation across replicas.
-// Stores that cannot (such as the no-op store) simply never grant a lock, which leaves
+// Locking is optional: cachestore.Locker is type-asserted rather than required, so a store
+// that cannot arbitrate (such as the no-op store) simply never grants a lock. That leaves
 // every caller resolving independently — correct, just without the deduplication.
-type locker interface {
-	tryLock(ctx context.Context, key string) (bool, error)
-	unlock(ctx context.Context, key string)
-	awaitLeader(ctx context.Context, key string) (entry, bool, error)
-}
 
 // tryLock claims the right to create key. It reports false when the store cannot lock,
 // when the lock is held elsewhere, or on failure — all cases where the caller should
 // resolve against Google rather than wait.
 func (r *resolver) tryLock(ctx context.Context, key string) bool {
-	l, ok := r.store.(locker)
+	l, ok := r.store.(cachestore.Locker)
 	if !ok {
 		return false
 	}
-	won, err := l.tryLock(ctx, key)
+	won, err := l.TryLock(ctx, key)
 	if err != nil {
 		r.logger.Warn("gcpcache: cache store lock failed, proceeding without coordination",
 			slog.String("error", err.Error()))
@@ -361,21 +357,21 @@ func (r *resolver) tryLock(ctx context.Context, key string) bool {
 }
 
 func (r *resolver) unlock(ctx context.Context, key string) {
-	if l, ok := r.store.(locker); ok {
-		l.unlock(ctx, key)
+	if l, ok := r.store.(cachestore.Locker); ok {
+		l.Unlock(ctx, key)
 	}
 }
 
 // awaitLeader waits for the replica holding the lock to publish its result.
-func (r *resolver) awaitLeader(ctx context.Context, key string) (entry, bool) {
-	l, ok := r.store.(locker)
+func (r *resolver) awaitLeader(ctx context.Context, key string) (cachestore.Entry, bool) {
+	l, ok := r.store.(cachestore.Locker)
 	if !ok {
-		return entry{}, false
+		return cachestore.Entry{}, false
 	}
-	e, found, err := l.awaitLeader(ctx, key)
+	e, found, err := l.AwaitLeader(ctx, key)
 	if err != nil {
 		// Includes the timeout case: fall through and resolve rather than fail.
-		return entry{}, false
+		return cachestore.Entry{}, false
 	}
 	return e, found
 }

@@ -219,9 +219,9 @@ spec:
                     - path
                     x-kubernetes-list-type: map
                 type: object
-              gcpContextCaching:
+              contextCaching:
                 description: |-
-                  GCPContextCaching configures Gemini context caching for this backend.
+                  ContextCaching configures Gemini context caching for this backend.
                   When set, the ai-gateway will automatically resolve or create a Google cachedContents
                   entry for requests that carry Anthropic-style cache_control markers, and inject the
                   resolved cache resource name into the Gemini API request.
@@ -680,9 +680,9 @@ spec:
                     - path
                     x-kubernetes-list-type: map
                 type: object
-              gcpContextCaching:
+              contextCaching:
                 description: |-
-                  GCPContextCaching configures Gemini context caching for this backend.
+                  ContextCaching configures Gemini context caching for this backend.
                   When set, the ai-gateway will automatically resolve or create a Google cachedContents
                   entry for requests that carry Anthropic-style cache_control markers, and inject the
                   resolved cache resource name into the Gemini API request.

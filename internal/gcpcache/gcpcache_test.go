@@ -23,6 +23,7 @@ import (
 
 	"github.com/envoyproxy/ai-gateway/internal/apischema/gcp"
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
+	"github.com/envoyproxy/ai-gateway/internal/cachestore"
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 	"github.com/envoyproxy/ai-gateway/internal/json"
@@ -147,9 +148,9 @@ func (t *redirectTransport) RoundTrip(req *http.Request) (*http.Response, error)
 
 // resolverWithServer builds a resolver pointed at a fake Google server. An optional store
 // may be supplied; with none, the no-op store applies and every lookup misses.
-func resolverWithServer(srvURL string, store ...CacheStore) *resolver {
+func resolverWithServer(srvURL string, store ...cachestore.Store) *resolver {
 	host := srvURL[len("http://"):]
-	var s CacheStore
+	var s cachestore.Store
 	if len(store) > 0 {
 		s = store[0]
 	}
@@ -159,12 +160,12 @@ func resolverWithServer(srvURL string, store ...CacheStore) *resolver {
 	}, s, nil).(*resolver)
 }
 
-// memStore is an in-process CacheStore for tests. It implements only the CacheStore
-// contract, not locker, so resolvers using it never coordinate — which is what the
+// memStore is an in-process cachestore.Store for tests. It implements only the cachestore.Store
+// contract, not cachestore.Locker, so resolvers using it never coordinate — which is what the
 // no-op-store path does in production too.
 type memStore struct {
 	mu      sync.Mutex
-	entries map[string]entry
+	entries map[string]cachestore.Entry
 	// getErr, when set, is returned from every Get, standing in for an unreachable store.
 	getErr error
 	// setErr, when set, is returned from every Set.
@@ -173,12 +174,12 @@ type memStore struct {
 	sets   atomic.Int64
 }
 
-func newMemStore() *memStore { return &memStore{entries: map[string]entry{}} }
+func newMemStore() *memStore { return &memStore{entries: map[string]cachestore.Entry{}} }
 
-func (m *memStore) Get(_ context.Context, key string) (entry, bool, error) {
+func (m *memStore) Get(_ context.Context, key string) (cachestore.Entry, bool, error) {
 	m.gets.Add(1)
 	if m.getErr != nil {
-		return entry{}, false, m.getErr
+		return cachestore.Entry{}, false, m.getErr
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -186,7 +187,7 @@ func (m *memStore) Get(_ context.Context, key string) (entry, bool, error) {
 	return e, ok, nil
 }
 
-func (m *memStore) Set(_ context.Context, key string, e entry, _ time.Duration) error {
+func (m *memStore) Set(_ context.Context, key string, e cachestore.Entry, _ time.Duration) error {
 	m.sets.Add(1)
 	if m.setErr != nil {
 		return m.setErr
@@ -200,7 +201,7 @@ func (m *memStore) Set(_ context.Context, key string, e entry, _ time.Duration) 
 func (m *memStore) seed(key, cacheName string, expireTime time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.entries[key] = entry{cacheName: cacheName, expireTime: expireTime}
+	m.entries[key] = cachestore.Entry{CacheName: cacheName, ExpireTime: expireTime}
 }
 
 // computeKeyForRequest replicates the key generation for use in test assertions.
