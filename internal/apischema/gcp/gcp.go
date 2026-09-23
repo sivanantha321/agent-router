@@ -189,7 +189,7 @@ type CreateCachedContent struct {
 	// Value must be a string in GCP duration format, e.g. "300s".
 	TTL string `json:"ttl,omitempty"`
 	// Optional. Timestamp of when this resource is considered expired.
-	ExpireTime time.Time `json:"expireTime,omitempty"`
+	ExpireTime *time.Time `json:"expireTime,omitempty"`
 	// The content to cache.
 	Contents []genai.Content `json:"contents"`
 	// Optional. Developer set system instruction.
