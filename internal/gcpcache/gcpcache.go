@@ -163,12 +163,19 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 	// treated as a miss, so an unreachable store degrades caching rather than the
 	// request. Google-side failures do fail fast.
 	if e, ok := r.storeGet(ctx, cacheKey); ok {
+		r.logger.Debug("gcpcache: store hit, skipping Google",
+			slog.String("cache_key", cacheKey),
+			slog.String("cache_name", e.CacheName),
+			slog.Time("expire_time", e.ExpireTime))
 		return &ResolveResult{
 			CacheName:  e.CacheName,
 			Messages:   remainderMessages,
 			ExpireTime: e.ExpireTime,
 		}, nil
 	}
+	r.logger.Debug("gcpcache: store miss, resolving against Google",
+		slog.String("cache_key", cacheKey),
+		slog.String("model", openAIReq.Model))
 
 	// Store miss — resolve against Google, collapsing concurrent misses for the same key
 	// into one list+create.
@@ -198,6 +205,9 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 	if !leader {
 		result.Created = false
 		result.TokenCount = 0
+		r.logger.Debug("gcpcache: attached to in-flight resolution by another request",
+			slog.String("cache_key", cacheKey),
+			slog.String("cache_name", result.CacheName))
 	}
 	return &result, nil
 }
@@ -235,9 +245,16 @@ func (r *resolver) resolveUncached(
 	// result; if the winner never publishes one, it falls through and resolves itself.
 	locked := r.tryLock(ctx, cacheKey)
 	if !locked {
+		r.logger.Debug("gcpcache: store lock held elsewhere, waiting for leader",
+			slog.String("cache_key", cacheKey))
 		if e, ok := r.awaitLeader(ctx, cacheKey); ok {
+			r.logger.Debug("gcpcache: leader published a cache name",
+				slog.String("cache_key", cacheKey),
+				slog.String("cache_name", e.CacheName))
 			return &ResolveResult{CacheName: e.CacheName, ExpireTime: e.ExpireTime}, nil
 		}
+		r.logger.Debug("gcpcache: leader published nothing, resolving against Google",
+			slog.String("cache_key", cacheKey))
 	}
 
 	// List existing caches and match by displayName (cacheKey).
@@ -251,6 +268,10 @@ func (r *resolver) resolveUncached(
 	}
 
 	if existingName != "" {
+		r.logger.Debug("gcpcache: Google list matched an existing cache",
+			slog.String("cache_key", cacheKey),
+			slog.String("cache_name", existingName),
+			slog.Time("expire_time", expireTime))
 		r.storeSet(ctx, cacheKey, cachestore.Entry{CacheName: existingName, ExpireTime: expireTime})
 		return &ResolveResult{
 			CacheName:  existingName,
@@ -261,6 +282,11 @@ func (r *resolver) resolveUncached(
 	// Cache not found — create it. A replica that did not win the lock still creates
 	// here, having already waited for the winner without result; this is the duplicate
 	// the lock narrows but cannot fully eliminate.
+	r.logger.Debug("gcpcache: no match on Google, creating a cache",
+		slog.String("cache_key", cacheKey),
+		slog.String("model", openAIReq.Model),
+		slog.String("ttl", ttl),
+		slog.Bool("holds_lock", locked))
 	created, tokenCount, expireTime, err := r.createCache(ctx, baseURL, accessToken, openAIReq.Model, region, project, cacheKey, contents, systemInstruction, geminiTools, ttl)
 	if err != nil {
 		// Release the claim so waiters retry immediately rather than blocking for the
@@ -275,6 +301,10 @@ func (r *resolver) resolveUncached(
 	finalName, finalExpire, listErr := r.listAndMatch(ctx, baseURL, accessToken, cacheKey, openAIReq.Model)
 	if listErr == nil && finalName != "" && finalName != created {
 		// Another replica created a cache with the same key; use the one from the list.
+		r.logger.Debug("gcpcache: duplicate create converged on another replica's cache",
+			slog.String("cache_key", cacheKey),
+			slog.String("created", created),
+			slog.String("cache_name", finalName))
 		r.storeSet(ctx, cacheKey, cachestore.Entry{CacheName: finalName, ExpireTime: finalExpire})
 		return &ResolveResult{
 			CacheName:  finalName,
@@ -282,6 +312,11 @@ func (r *resolver) resolveUncached(
 		}, nil
 	}
 
+	r.logger.Debug("gcpcache: created a new cache on Google",
+		slog.String("cache_key", cacheKey),
+		slog.String("cache_name", created),
+		slog.Int("token_count", tokenCount),
+		slog.Time("expire_time", expireTime))
 	r.storeSet(ctx, cacheKey, cachestore.Entry{CacheName: created, ExpireTime: expireTime})
 	return &ResolveResult{
 		CacheName:  created,
