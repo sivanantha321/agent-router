@@ -62,6 +62,12 @@ type Server struct {
 	routerProcessorsPerReqID      map[string]Processor
 	routerProcessorsPerReqIDMutex sync.RWMutex
 	uuidFn                        func() string
+	// cacheResolvers holds one context-cache resolver per GCP backend, keyed by
+	// "<backend name>|<redis url>". Resolvers are carried across config reloads so a
+	// filterapi update does not tear down and rebuild the Redis connection pool. The
+	// Redis URL is part of the key so that repointing a backend at a different Redis
+	// builds a new resolver rather than reusing a pool aimed at the old one.
+	cacheResolvers map[string]gcpcache.CacheResolver
 }
 
 // NewServer creates a new external processor server.
@@ -73,6 +79,7 @@ func NewServer(logger *slog.Logger, enableRedaction bool) (*Server, error) {
 		enableRedaction:          enableRedaction,
 		processorFactories:       make(map[string]ProcessorFactory),
 		routerProcessorsPerReqID: make(map[string]Processor),
+		cacheResolvers:           make(map[string]gcpcache.CacheResolver),
 		uuidFn:                   uuid.NewString,
 	}
 	return srv, nil
@@ -85,16 +92,44 @@ func (s *Server) LoadConfig(ctx context.Context, config *filterapi.Config) error
 		return fmt.Errorf("cannot create runtime filter config: %w", err)
 	}
 
-	// Attach a shared in-process context-cache resolver for each GCP Vertex AI backend
-	// that has context caching explicitly enabled. The resolver is reused across requests
-	// so the in-memory TTL memo is preserved.
-	for _, rb := range newConfig.Backends {
-		if _, ok := rb.Handler.(filterapi.GCPAuthHandler); ok {
-			if rb.Backend.GCPContextCaching != nil && rb.Backend.GCPContextCaching.Enabled {
-				rb.CacheResolver = gcpcache.New(nil)
-			}
-		}
+	// LoadConfig is reachable on a Server built directly rather than through NewServer
+	// (notably in tests), so the logger is resolved here rather than assumed non-nil.
+	logger := s.logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
 	}
+
+	// Attach a context-cache resolver to each GCP Vertex AI backend that configures
+	// context caching. Resolvers are reused across reloads so that a config update does
+	// not tear down and rebuild each backend's Redis connection pool; resolvers for
+	// backends that disappeared or dropped their cache config are discarded.
+	live := make(map[string]gcpcache.CacheResolver, len(s.cacheResolvers))
+	for _, rb := range newConfig.Backends {
+		if _, ok := rb.Handler.(filterapi.GCPAuthHandler); !ok {
+			continue
+		}
+		cc := rb.Backend.ContextCache
+		if cc == nil || cc.URL == "" {
+			continue
+		}
+		key := rb.Backend.Name + "|" + cc.URL
+		resolver, ok := s.cacheResolvers[key]
+		if !ok {
+			store, err := gcpcache.NewRedisStore(cc.URL)
+			if err != nil {
+				// A bad URL disables caching for this backend rather than failing the
+				// reload: the store is an optimization, and rejecting the whole config
+				// would take down backends that have nothing to do with caching.
+				logger.Warn("invalid context cache redis url, serving backend uncached",
+					slog.String("backend", rb.Backend.Name), slog.String("error", err.Error()))
+				continue
+			}
+			resolver = gcpcache.New(nil, store, logger)
+		}
+		live[key] = resolver
+		rb.CacheResolver = resolver
+	}
+	s.cacheResolvers = live
 
 	s.config = newConfig // This is racey, but we don't care.
 	return nil

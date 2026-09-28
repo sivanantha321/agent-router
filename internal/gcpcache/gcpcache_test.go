@@ -9,6 +9,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -97,9 +99,14 @@ type fakeCacheServer struct {
 	listResponse string
 	createStatus int
 	createBody   string
-	listCalls    int
-	createCalls  int
+	// Counters are atomic because the httptest handler runs on a goroutine per
+	// request, and the concurrency tests below drive many at once.
+	listCalls   atomic.Int64
+	createCalls atomic.Int64
 }
+
+func (f *fakeCacheServer) lists() int   { return int(f.listCalls.Load()) }
+func (f *fakeCacheServer) creates() int { return int(f.createCalls.Load()) }
 
 func newFakeCacheServer(t *testing.T, listBody, createBody string, createStatus int) *fakeCacheServer {
 	t.Helper()
@@ -112,11 +119,11 @@ func newFakeCacheServer(t *testing.T, listBody, createBody string, createStatus 
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Method {
 		case http.MethodGet:
-			f.listCalls++
+			f.listCalls.Add(1)
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(f.listResponse))
 		case http.MethodPost:
-			f.createCalls++
+			f.createCalls.Add(1)
 			w.WriteHeader(f.createStatus)
 			_, _ = w.Write([]byte(f.createBody))
 		}
@@ -137,12 +144,62 @@ func (t *redirectTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	return http.DefaultTransport.RoundTrip(req2)
 }
 
-func resolverWithServer(srvURL string) *resolver {
+// resolverWithServer builds a resolver pointed at a fake Google server. An optional store
+// may be supplied; with none, the no-op store applies and every lookup misses.
+func resolverWithServer(srvURL string, store ...CacheStore) *resolver {
 	host := srvURL[len("http://"):]
+	var s CacheStore
+	if len(store) > 0 {
+		s = store[0]
+	}
 	return New(&http.Client{
 		Transport: &redirectTransport{fakeHost: host},
 		Timeout:   5 * time.Second,
-	}).(*resolver)
+	}, s, nil).(*resolver)
+}
+
+// memStore is an in-process CacheStore for tests. It implements only the CacheStore
+// contract, not locker, so resolvers using it never coordinate — which is what the
+// no-op-store path does in production too.
+type memStore struct {
+	mu      sync.Mutex
+	entries map[string]entry
+	// getErr, when set, is returned from every Get, standing in for an unreachable store.
+	getErr error
+	// setErr, when set, is returned from every Set.
+	setErr error
+	gets   atomic.Int64
+	sets   atomic.Int64
+}
+
+func newMemStore() *memStore { return &memStore{entries: map[string]entry{}} }
+
+func (m *memStore) Get(_ context.Context, key string) (entry, bool, error) {
+	m.gets.Add(1)
+	if m.getErr != nil {
+		return entry{}, false, m.getErr
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e, ok := m.entries[key]
+	return e, ok, nil
+}
+
+func (m *memStore) Set(_ context.Context, key string, e entry, _ time.Duration) error {
+	m.sets.Add(1)
+	if m.setErr != nil {
+		return m.setErr
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.entries[key] = e
+	return nil
+}
+
+func (m *memStore) seed(key, cacheName string, expireTime time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.entries[key] = entry{cacheName: cacheName, expireTime: expireTime}
 }
 
 // computeKeyForRequest replicates the key generation for use in test assertions.
@@ -293,7 +350,7 @@ func TestComputeCacheKey_DifferentModels_DifferentKeys(t *testing.T) {
 // -----------------------------------------------------------------------
 
 func TestResolver_NoMarkers_ReturnsNil(t *testing.T) {
-	r := New(nil).(*resolver)
+	r := New(nil, nil, nil).(*resolver)
 	req := &openai.ChatCompletionRequest{
 		Model:    "gemini-1.5-pro",
 		Messages: []openai.ChatCompletionMessageParamUnion{userMsg("hello")},
@@ -328,8 +385,8 @@ func TestResolver_CacheMiss_Creates(t *testing.T) {
 	// remainder = messages after the breakpoint (index 0 → only userMsg at index 1 remains)
 	assert.Equal(t, []openai.ChatCompletionMessageParamUnion{userMsg("Hello")}, res.Messages)
 	// list → create → re-list (post-create convergence check)
-	assert.Equal(t, 2, fake.listCalls)
-	assert.Equal(t, 1, fake.createCalls)
+	assert.Equal(t, 2, fake.lists())
+	assert.Equal(t, 1, fake.creates())
 }
 
 func TestResolver_CacheHit_FromGoogleList(t *testing.T) {
@@ -364,12 +421,13 @@ func TestResolver_CacheHit_FromGoogleList(t *testing.T) {
 	require.NotNil(t, res)
 	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/existing", res.CacheName)
 	assert.False(t, res.Created)
-	assert.Equal(t, 0, fake.createCalls)
+	assert.Equal(t, 0, fake.creates())
 }
 
-func TestResolver_MemoHit_SkipsGoogleAPICalls(t *testing.T) {
+func TestResolver_StoreHit_SkipsGoogleAPICalls(t *testing.T) {
 	fake := newFakeCacheServer(t, `{"cachedContents":[]}`, "", http.StatusOK)
-	r := resolverWithServer(fake.srv.URL)
+	store := newMemStore()
+	r := resolverWithServer(fake.srv.URL, store)
 
 	req := &openai.ChatCompletionRequest{
 		Model: "gemini-1.5-pro",
@@ -379,19 +437,19 @@ func TestResolver_MemoHit_SkipsGoogleAPICalls(t *testing.T) {
 		},
 	}
 	key := computeKeyForRequest(t, req)
-	r.setMemo(key, "projects/p/locations/r/cachedContents/memo-hit", time.Now().Add(10*time.Minute))
+	store.seed(key, "projects/p/locations/r/cachedContents/store-hit", time.Now().Add(10*time.Minute))
 
 	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
 	res, err := r.Resolve(context.Background(), req, auth)
 	require.NoError(t, err)
 	require.NotNil(t, res)
-	assert.Equal(t, "projects/p/locations/r/cachedContents/memo-hit", res.CacheName)
+	assert.Equal(t, "projects/p/locations/r/cachedContents/store-hit", res.CacheName)
 	assert.False(t, res.Created)
-	assert.Equal(t, 0, fake.listCalls, "memo hit must not call the Google API")
-	assert.Equal(t, 0, fake.createCalls)
+	assert.Equal(t, 0, fake.lists(), "store hit must not call the Google API")
+	assert.Equal(t, 0, fake.creates())
 }
 
-func TestResolver_MemoExpiry_Refetches(t *testing.T) {
+func TestResolver_StoreEntryExpiring_Refetches(t *testing.T) {
 	req := &openai.ChatCompletionRequest{
 		Model: "gemini-1.5-pro",
 		Messages: []openai.ChatCompletionMessageParamUnion{
@@ -413,16 +471,17 @@ func TestResolver_MemoExpiry_Refetches(t *testing.T) {
 		},
 	})
 	fake := newFakeCacheServer(t, string(listBody), "", http.StatusOK)
-	r := resolverWithServer(fake.srv.URL)
-	// Seed with entry expiring within the 10 s stale window → should be evicted.
-	r.setMemo(key, "projects/p/locations/us-central1/cachedContents/stale", time.Now().Add(5*time.Second))
+	store := newMemStore()
+	r := resolverWithServer(fake.srv.URL, store)
+	// Seed with an entry expiring inside the stale window → must be treated as a miss.
+	store.seed(key, "projects/p/locations/us-central1/cachedContents/stale", time.Now().Add(5*time.Second))
 
 	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
 	res, err := r.Resolve(context.Background(), req, auth)
 	require.NoError(t, err)
 	require.NotNil(t, res)
 	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/refreshed", res.CacheName)
-	assert.Equal(t, 1, fake.listCalls, "stale memo must trigger a list call")
+	assert.Equal(t, 1, fake.lists(), "a near-expiry store entry must trigger a list call")
 }
 
 func TestResolver_CreateFailure_ReturnsError(t *testing.T) {

@@ -54,7 +54,7 @@ func TestServer_LoadConfig(t *testing.T) {
 }
 
 // TestServer_LoadConfig_GCPCacheResolver verifies that a CacheResolver is attached
-// to a GCP backend only when GCPContextCaching.Enabled is true.
+// to a GCP backend only when ContextCache is configured with a store URL.
 func TestServer_LoadConfig_GCPCacheResolver(t *testing.T) {
 	s := &Server{}
 
@@ -66,15 +66,15 @@ func TestServer_LoadConfig_GCPCacheResolver(t *testing.T) {
 				Auth: &filterapi.BackendAuth{
 					GCPAuth: &filterapi.GCPAuth{AccessToken: "token"},
 				},
-				GCPContextCaching: &filterapi.GCPContextCaching{Enabled: true, DefaultTTL: "600s"},
+				ContextCache: &filterapi.ContextCache{URL: "localhost:6379", DefaultTTL: "600s"},
 			},
 			{
-				Name:   "gcp-caching-off",
+				Name:   "gcp-caching-no-url",
 				Schema: filterapi.VersionedAPISchema{Name: filterapi.APISchemaGCPVertexAI},
 				Auth: &filterapi.BackendAuth{
 					GCPAuth: &filterapi.GCPAuth{AccessToken: "token"},
 				},
-				GCPContextCaching: &filterapi.GCPContextCaching{Enabled: false},
+				ContextCache: &filterapi.ContextCache{},
 			},
 			{
 				Name:   "gcp-no-caching-field",
@@ -82,7 +82,7 @@ func TestServer_LoadConfig_GCPCacheResolver(t *testing.T) {
 				Auth: &filterapi.BackendAuth{
 					GCPAuth: &filterapi.GCPAuth{AccessToken: "token"},
 				},
-				// GCPContextCaching is nil.
+				// ContextCache is nil.
 			},
 			{
 				Name:   "non-gcp",
@@ -96,16 +96,88 @@ func TestServer_LoadConfig_GCPCacheResolver(t *testing.T) {
 	require.NoError(t, err)
 
 	rb := s.config.Backends["gcp-caching-on"]
-	require.NotNil(t, rb.CacheResolver, "CacheResolver must be set when GCPContextCaching.Enabled=true")
+	require.NotNil(t, rb.CacheResolver, "CacheResolver must be set when ContextCache has a store URL")
 
-	rb = s.config.Backends["gcp-caching-off"]
-	require.Nil(t, rb.CacheResolver, "CacheResolver must be nil when GCPContextCaching.Enabled=false")
+	rb = s.config.Backends["gcp-caching-no-url"]
+	require.Nil(t, rb.CacheResolver, "CacheResolver must be nil when ContextCache has no store URL")
 
 	rb = s.config.Backends["gcp-no-caching-field"]
-	require.Nil(t, rb.CacheResolver, "CacheResolver must be nil when GCPContextCaching is absent")
+	require.Nil(t, rb.CacheResolver, "CacheResolver must be nil when ContextCache is absent")
 
 	rb = s.config.Backends["non-gcp"]
 	require.Nil(t, rb.CacheResolver, "CacheResolver must be nil for non-GCP backends")
+}
+
+// gcpBackendWithCaching builds a GCP backend whose context caching points at redisURL.
+func gcpBackendWithCaching(name, redisURL string) filterapi.Backend {
+	return filterapi.Backend{
+		Name:         name,
+		Schema:       filterapi.VersionedAPISchema{Name: filterapi.APISchemaGCPVertexAI},
+		Auth:         &filterapi.BackendAuth{GCPAuth: &filterapi.GCPAuth{AccessToken: "token"}},
+		ContextCache: &filterapi.ContextCache{URL: redisURL, DefaultTTL: "600s"},
+	}
+}
+
+// A resolver owns a Redis connection pool. Rebuilding it on every filterapi update would
+// discard live connections on a hot path that fires whenever any unrelated backend changes.
+func TestServer_LoadConfig_GCPCacheResolver_ReusedAcrossReloads(t *testing.T) {
+	s := &Server{}
+	config := &filterapi.Config{Backends: []filterapi.Backend{gcpBackendWithCaching("gcp", "localhost:6379")}}
+
+	require.NoError(t, s.LoadConfig(t.Context(), config))
+	first := s.config.Backends["gcp"].CacheResolver
+	require.NotNil(t, first)
+
+	require.NoError(t, s.LoadConfig(t.Context(), config))
+	require.Same(t, first, s.config.Backends["gcp"].CacheResolver,
+		"an unchanged backend must keep its resolver, and with it its connection pool")
+}
+
+// Repointing a backend at a different Redis must not keep reusing a pool dialing the old one.
+func TestServer_LoadConfig_GCPCacheResolver_RebuiltWhenRedisURLChanges(t *testing.T) {
+	s := &Server{}
+
+	require.NoError(t, s.LoadConfig(t.Context(),
+		&filterapi.Config{Backends: []filterapi.Backend{gcpBackendWithCaching("gcp", "localhost:6379")}}))
+	first := s.config.Backends["gcp"].CacheResolver
+	require.NotNil(t, first)
+
+	require.NoError(t, s.LoadConfig(t.Context(),
+		&filterapi.Config{Backends: []filterapi.Backend{gcpBackendWithCaching("gcp", "localhost:6380")}}))
+	require.NotSame(t, first, s.config.Backends["gcp"].CacheResolver,
+		"a new Redis URL must produce a new resolver")
+}
+
+// Resolvers for backends that vanish must not accumulate: the map is rebuilt each reload.
+func TestServer_LoadConfig_GCPCacheResolver_DroppedWhenBackendDisappears(t *testing.T) {
+	s := &Server{}
+
+	require.NoError(t, s.LoadConfig(t.Context(), &filterapi.Config{Backends: []filterapi.Backend{
+		gcpBackendWithCaching("gcp-a", "localhost:6379"),
+		gcpBackendWithCaching("gcp-b", "localhost:6379"),
+	}}))
+	require.Len(t, s.cacheResolvers, 2)
+
+	require.NoError(t, s.LoadConfig(t.Context(), &filterapi.Config{Backends: []filterapi.Backend{
+		gcpBackendWithCaching("gcp-a", "localhost:6379"),
+	}}))
+	require.Len(t, s.cacheResolvers, 1, "the departed backend's resolver must be released")
+}
+
+// A malformed Redis URL disables caching for that backend rather than failing the whole
+// reload, which would take down backends that have nothing to do with caching.
+func TestServer_LoadConfig_GCPCacheResolver_BadRedisURLDoesNotFailReload(t *testing.T) {
+	s := &Server{}
+	config := &filterapi.Config{Backends: []filterapi.Backend{
+		gcpBackendWithCaching("gcp-bad-redis", "http://not-a-redis-url"),
+		gcpBackendWithCaching("gcp-ok", "localhost:6379"),
+	}}
+
+	require.NoError(t, s.LoadConfig(t.Context(), config), "a bad redis url must not fail the reload")
+	require.Nil(t, s.config.Backends["gcp-bad-redis"].CacheResolver,
+		"a backend whose store cannot be built is served uncached")
+	require.NotNil(t, s.config.Backends["gcp-ok"].CacheResolver,
+		"an unrelated backend must keep its resolver")
 }
 
 func TestServer_Check(t *testing.T) {

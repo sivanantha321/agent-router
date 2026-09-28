@@ -4129,10 +4129,10 @@ func TestGatewayController_warnUndeclaredMetadataNamespaces(t *testing.T) {
 	require.Empty(t, logged)
 }
 
-// TestGatewayController_reconcileFilterConfigSecret_GCPContextCaching verifies that the
-// GCPContextCaching field on an AIServiceBackend is propagated to filterapi.Backend in the
+// TestGatewayController_reconcileFilterConfigSecret_ContextCache verifies that the
+// ContextCache field on an AIServiceBackend is propagated to filterapi.Backend in the
 // rendered filter configuration secret.
-func TestGatewayController_reconcileFilterConfigSecret_GCPContextCaching(t *testing.T) {
+func TestGatewayController_reconcileFilterConfigSecret_ContextCache(t *testing.T) {
 	const gwNamespace, someNamespace = "ns", "some-namespace"
 	fakeClient := requireNewFakeClientWithIndexes(t)
 	kube := fake2.NewClientset()
@@ -4154,7 +4154,7 @@ func TestGatewayController_reconcileFilterConfigSecret_GCPContextCaching(t *test
 		},
 	}
 
-	// Create the AIServiceBackend with GCPContextCaching enabled.
+	// Create the AIServiceBackend with ContextCache configured.
 	err := fakeClient.Create(t.Context(), &aigv1b1.AIServiceBackend{
 		ObjectMeta: metav1.ObjectMeta{Name: "gcp-backend", Namespace: gwNamespace},
 		Spec: aigv1b1.AIServiceBackendSpec{
@@ -4164,9 +4164,9 @@ func TestGatewayController_reconcileFilterConfigSecret_GCPContextCaching(t *test
 				Kind:  ptr.To(gwapiv1.Kind("Backend")),
 				Group: ptr.To(gwapiv1.Group("gateway.envoyproxy.io")),
 			},
-			GCPContextCaching: &aigv1b1.GCPContextCachingSpec{
-				Enabled:    true,
+			ContextCache: &aigv1b1.ContextCacheSpec{
 				DefaultTTL: "600s",
+				URL:        "redis.default.svc.cluster.local:6379",
 			},
 		},
 	})
@@ -4186,14 +4186,15 @@ func TestGatewayController_reconcileFilterConfigSecret_GCPContextCaching(t *test
 		}
 	}
 	require.NotNil(t, gcpBackend, "expected to find gcp-backend in filter config")
-	require.NotNil(t, gcpBackend.GCPContextCaching, "GCPContextCaching must be populated in filter config")
-	require.True(t, gcpBackend.GCPContextCaching.Enabled)
-	require.Equal(t, "600s", gcpBackend.GCPContextCaching.DefaultTTL)
+	require.NotNil(t, gcpBackend.ContextCache, "ContextCache must be populated in filter config")
+	require.Equal(t, "600s", gcpBackend.ContextCache.DefaultTTL)
+	require.Equal(t, "redis.default.svc.cluster.local:6379", gcpBackend.ContextCache.URL,
+		"the redis store location must reach the data plane")
 }
 
-// TestGatewayController_reconcileFilterConfigSecret_GCPContextCaching_NilWhenAbsent verifies that
-// when GCPContextCaching is not set on the AIServiceBackend, filterapi.Backend.GCPContextCaching is nil.
-func TestGatewayController_reconcileFilterConfigSecret_GCPContextCaching_NilWhenAbsent(t *testing.T) {
+// TestGatewayController_reconcileFilterConfigSecret_ContextCache_NilWhenAbsent verifies that
+// when ContextCache is not set on the AIServiceBackend, filterapi.Backend.ContextCache is nil.
+func TestGatewayController_reconcileFilterConfigSecret_ContextCache_NilWhenAbsent(t *testing.T) {
 	const gwNamespace, someNamespace = "ns2", "some-namespace2"
 	fakeClient := requireNewFakeClientWithIndexes(t)
 	kube := fake2.NewClientset()
@@ -4224,7 +4225,7 @@ func TestGatewayController_reconcileFilterConfigSecret_GCPContextCaching_NilWhen
 				Kind:  ptr.To(gwapiv1.Kind("Backend")),
 				Group: ptr.To(gwapiv1.Group("gateway.envoyproxy.io")),
 			},
-			// GCPContextCaching intentionally omitted.
+			// ContextCache intentionally omitted.
 		},
 	})
 	require.NoError(t, err)
@@ -4242,5 +4243,5 @@ func TestGatewayController_reconcileFilterConfigSecret_GCPContextCaching_NilWhen
 		}
 	}
 	require.NotNil(t, gcpBackend, "expected to find gcp-backend2 in filter config")
-	require.Nil(t, gcpBackend.GCPContextCaching, "GCPContextCaching must be nil when not set on the CRD")
+	require.Nil(t, gcpBackend.ContextCache, "ContextCache must be nil when not set on the CRD")
 }
