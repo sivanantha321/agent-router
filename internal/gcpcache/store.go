@@ -19,9 +19,10 @@ type entry struct {
 // CacheStore is the storage layer behind the resolver, mapping a deterministic cache
 // key to the Google cache name it resolved to.
 //
-// The store is shared across gateway replicas, which is what prevents two replicas
-// from independently creating a cache for the same prefix. Implementations must be
-// safe for concurrent use.
+// The store is shared across gateway replicas, so a cache name published by one
+// replica is reused by all of them. It is a cache, not a lock: replicas that miss the
+// same cold prefix at the same moment may each create a Google cache, and the resolver
+// tolerates that. Implementations must be safe for concurrent use.
 //
 // Store errors are never fatal to a request: the resolver treats them as a cache miss
 // and proceeds to Google. See the failure policy in the Redis cache store proposal.

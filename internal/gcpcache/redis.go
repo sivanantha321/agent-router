@@ -74,6 +74,26 @@ func (s *redisStore) Set(ctx context.Context, key string, e entry, ttl time.Dura
 	return nil
 }
 
+// setNX implements reconcileStore.
+func (s *redisStore) setNX(ctx context.Context, key string, e entry, ttl time.Duration) (bool, error) {
+	wrote, err := s.client.SetNX(ctx, key, encodeEntry(e), ttl).Result()
+	if err != nil {
+		return false, fmt.Errorf("gcpcache: redis setnx: %w", err)
+	}
+	return wrote, nil
+}
+
+// acquireGate implements reconcileStore.
+func (s *redisStore) acquireGate(ctx context.Context, key string, ttl time.Duration) (bool, error) {
+	won, err := s.client.SetNX(ctx, key, "1", ttl).Result()
+	if err != nil {
+		return false, fmt.Errorf("gcpcache: redis gate: %w", err)
+	}
+	return won, nil
+}
+
+var _ reconcileStore = (*redisStore)(nil)
+
 // encodeEntry serializes an entry as "<RFC3339 expiry>|<cache name>". The cache name is
 // last because it is the only field that may itself contain the separator.
 func encodeEntry(e entry) string {
