@@ -32,6 +32,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"google.golang.org/genai"
@@ -92,6 +93,67 @@ type resolver struct {
 	// logger records store failures, which are otherwise invisible because the request
 	// proceeds normally.
 	logger *slog.Logger
+
+	// mu guards the background reconciler's lifecycle.
+	mu sync.Mutex
+	// cancel stops the reconciler; nil until Start runs one.
+	cancel context.CancelFunc
+	// done is closed when the reconciler goroutine exits.
+	done chan struct{}
+	// closed is set by Close, after which Start does nothing.
+	closed bool
+}
+
+// reconcileInterval is how often the background reconciler runs a round. Between rounds,
+// a cache the store has forgotten is not rediscovered, so this bounds how long drift
+// persists. It is sized against the 300s default cache TTL.
+const reconcileInterval = 60 * time.Second
+
+// Background is implemented by resolvers that run background work. It is kept out of
+// CacheResolver so that request-path callers need not know about it; LoadConfig reaches
+// it through a type assertion.
+type Background interface {
+	// Start begins background reconciliation for gcpAuth's project and region. It runs
+	// under a context the resolver owns, not the caller's, so it outlives the call. It
+	// does nothing if already started, if closed, or if the store cannot reconcile.
+	Start(gcpAuth filterapi.GCPAuthHandler)
+	// Close stops background work and waits for it to exit. It is idempotent.
+	io.Closer
+}
+
+var _ Background = (*resolver)(nil)
+
+// Start implements Background.
+func (r *resolver) Start(gcpAuth filterapi.GCPAuthHandler) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.cancel != nil {
+		return
+	}
+	rc, ok := r.newReconciler(gcpAuth, reconcileInterval)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	r.cancel = cancel
+	r.done = make(chan struct{})
+	go func() {
+		defer close(r.done)
+		rc.Run(ctx)
+	}()
+}
+
+// Close implements Background.
+func (r *resolver) Close() error {
+	r.mu.Lock()
+	r.closed = true
+	cancel, done := r.cancel, r.done
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		<-done
+	}
+	return nil
 }
 
 // New creates a new CacheResolver.

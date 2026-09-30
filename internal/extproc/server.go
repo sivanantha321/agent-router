@@ -127,13 +127,39 @@ func (s *Server) LoadConfig(ctx context.Context, config *filterapi.Config) error
 			}
 			resolver = gcpcache.New(nil, store, logger)
 		}
+		if bg, ok := resolver.(gcpcache.Background); ok {
+			// Start is a no-op for a resolver already running, so reused resolvers are
+			// unaffected. It runs under the resolver's own context, not ctx, which is
+			// cancelled when this reload finishes.
+			bg.Start(rb.Handler.(filterapi.GCPAuthHandler))
+		}
 		live[key] = resolver
 		rb.CacheResolver = resolver
+	}
+	// Stop the background work of resolvers that were not carried into this config: their
+	// backend was removed, lost its cache config, or was repointed at another Redis.
+	for key, resolver := range s.cacheResolvers {
+		if _, ok := live[key]; ok {
+			continue
+		}
+		if c, ok := resolver.(io.Closer); ok {
+			_ = c.Close()
+		}
 	}
 	s.cacheResolvers = live
 
 	s.config = newConfig // This is racey, but we don't care.
 	return nil
+}
+
+// Close stops the background work of every context-cache resolver. It is safe to call
+// more than once.
+func (s *Server) Close() {
+	for _, resolver := range s.cacheResolvers {
+		if c, ok := resolver.(io.Closer); ok {
+			_ = c.Close()
+		}
+	}
 }
 
 // Register a new processor for the given request path.

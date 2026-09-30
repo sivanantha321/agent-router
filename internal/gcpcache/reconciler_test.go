@@ -240,3 +240,59 @@ func TestIsCacheKey(t *testing.T) {
 	assert.False(t, isCacheKey(strings.Repeat("z", 64)))
 	assert.False(t, isCacheKey(testKey(7)[:63]))
 }
+
+// -----------------------------------------------------------------------
+// Lifecycle
+// -----------------------------------------------------------------------
+
+func TestResolver_StartRunsReconcilerAndCloseStopsIt(t *testing.T) {
+	exp := time.Now().Add(5 * time.Minute)
+	srv, calls, _ := newListServer(t, map[string]string{
+		"": `{"cachedContents":[` + itemJSON(testKey(1), "c/1", exp) + `]}`,
+	})
+	store, mr := newTestRedisStore(t)
+	r := resolverWithServer(srv.URL, store)
+
+	r.Start(reconcileAuth)
+	require.Eventually(t, func() bool { return mr.Exists(testKey(1)) }, 2*time.Second, 10*time.Millisecond,
+		"Start must run a reconcile round")
+
+	require.NoError(t, r.Close())
+	select {
+	case <-r.done:
+	default:
+		t.Fatal("Close must wait for the reconciler goroutine to exit")
+	}
+	assert.Equal(t, int64(1), calls.Load())
+}
+
+func TestResolver_StartIsIdempotent(t *testing.T) {
+	srv, _, _ := newListServer(t, map[string]string{"": `{"cachedContents":[]}`})
+	store, _ := newTestRedisStore(t)
+	r := resolverWithServer(srv.URL, store)
+
+	r.Start(reconcileAuth)
+	first := r.done
+	r.Start(reconcileAuth)
+	assert.Equal(t, first, r.done, "a second Start must not launch another reconciler")
+	require.NoError(t, r.Close())
+}
+
+func TestResolver_CloseIsIdempotentAndBlocksLaterStart(t *testing.T) {
+	srv, calls, _ := newListServer(t, map[string]string{"": `{"cachedContents":[]}`})
+	store, _ := newTestRedisStore(t)
+	r := resolverWithServer(srv.URL, store)
+
+	require.NoError(t, r.Close(), "Close before Start must be safe")
+	require.NoError(t, r.Close())
+	r.Start(reconcileAuth)
+	assert.Nil(t, r.cancel, "Start after Close must do nothing")
+	assert.Equal(t, int64(0), calls.Load())
+}
+
+func TestResolver_StartWithNoopStoreDoesNothing(t *testing.T) {
+	r := New(nil, nil, nil).(*resolver)
+	r.Start(reconcileAuth)
+	assert.Nil(t, r.cancel)
+	require.NoError(t, r.Close())
+}
