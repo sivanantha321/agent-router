@@ -7,8 +7,11 @@ package gcpcache
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,21 +74,6 @@ func TestRedisStore_GetMiss(t *testing.T) {
 	assert.False(t, ok)
 }
 
-// A key holding the create sentinel is a claim, not a result: reporting it as a hit would
-// hand the caller the sentinel string as a cache name.
-func TestRedisStore_SentinelIsAMiss(t *testing.T) {
-	s, _ := newTestRedisStore(t)
-	ctx := context.Background()
-
-	won, err := s.tryLock(ctx, "k")
-	require.NoError(t, err)
-	require.True(t, won)
-
-	_, ok, err := s.Get(ctx, "k")
-	require.NoError(t, err)
-	assert.False(t, ok, "an in-flight create must not read as a cache hit")
-}
-
 // A value that does not decode is treated as a miss rather than an error: it is not worth
 // failing a resolution over, and the next write overwrites it.
 func TestRedisStore_MalformedValueIsAMiss(t *testing.T) {
@@ -95,112 +83,6 @@ func TestRedisStore_MalformedValueIsAMiss(t *testing.T) {
 	_, ok, err := s.Get(context.Background(), "k")
 	require.NoError(t, err)
 	assert.False(t, ok)
-}
-
-func TestRedisStore_TryLockIsExclusive(t *testing.T) {
-	s, _ := newTestRedisStore(t)
-	ctx := context.Background()
-
-	first, err := s.tryLock(ctx, "k")
-	require.NoError(t, err)
-	assert.True(t, first)
-
-	second, err := s.tryLock(ctx, "k")
-	require.NoError(t, err)
-	assert.False(t, second, "a second claim on a held key must lose")
-}
-
-// unlock must not delete a key that has moved on from the sentinel, or it would erase a
-// published cache name (or another replica's fresh claim after the lock expired).
-func TestRedisStore_UnlockOnlyRemovesOwnSentinel(t *testing.T) {
-	s, _ := newTestRedisStore(t)
-	ctx := context.Background()
-	expire := time.Now().Add(10 * time.Minute)
-
-	won, err := s.tryLock(ctx, "k")
-	require.NoError(t, err)
-	require.True(t, won)
-	require.NoError(t, s.Set(ctx, "k", entry{cacheName: "published", expireTime: expire}, time.Minute))
-
-	s.unlock(ctx, "k")
-
-	got, ok, err := s.Get(ctx, "k")
-	require.NoError(t, err)
-	require.True(t, ok, "unlock must not erase a published result")
-	assert.Equal(t, "published", got.cacheName)
-}
-
-func TestRedisStore_UnlockReleasesClaim(t *testing.T) {
-	s, _ := newTestRedisStore(t)
-	ctx := context.Background()
-
-	won, err := s.tryLock(ctx, "k")
-	require.NoError(t, err)
-	require.True(t, won)
-	s.unlock(ctx, "k")
-
-	again, err := s.tryLock(ctx, "k")
-	require.NoError(t, err)
-	assert.True(t, again, "a released claim must be re-claimable immediately")
-}
-
-func TestRedisStore_AwaitLeader_ReturnsPublishedResult(t *testing.T) {
-	s, _ := newTestRedisStore(t)
-	ctx := context.Background()
-	expire := time.Now().Add(10 * time.Minute).UTC().Truncate(time.Second)
-
-	won, err := s.tryLock(ctx, "k")
-	require.NoError(t, err)
-	require.True(t, won)
-
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		_ = s.Set(ctx, "k", entry{cacheName: "from-leader", expireTime: expire}, time.Minute)
-	}()
-
-	got, ok, err := s.awaitLeader(ctx, "k")
-	require.NoError(t, err)
-	require.True(t, ok)
-	assert.Equal(t, "from-leader", got.cacheName)
-}
-
-// A leader that releases without publishing must not strand its waiters for the rest of
-// lockWaitTime; they are told to resolve themselves as soon as the claim disappears.
-func TestRedisStore_AwaitLeader_ClaimReleasedWithoutResult(t *testing.T) {
-	s, _ := newTestRedisStore(t)
-	ctx := context.Background()
-
-	won, err := s.tryLock(ctx, "k")
-	require.NoError(t, err)
-	require.True(t, won)
-
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		s.unlock(ctx, "k")
-	}()
-
-	start := time.Now()
-	_, ok, err := s.awaitLeader(ctx, "k")
-	require.ErrorIs(t, err, errLockHeld)
-	assert.False(t, ok)
-	assert.Less(t, time.Since(start), lockWaitTime, "waiter must not block for the full wait window")
-}
-
-func TestRedisStore_AwaitLeader_HonorsContextCancellation(t *testing.T) {
-	s, _ := newTestRedisStore(t)
-	ctx, cancel := context.WithCancel(context.Background())
-
-	won, err := s.tryLock(ctx, "k")
-	require.NoError(t, err)
-	require.True(t, won)
-
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		cancel()
-	}()
-
-	_, _, err = s.awaitLeader(ctx, "k")
-	require.ErrorIs(t, err, context.Canceled)
 }
 
 func TestEncodeDecodeEntry(t *testing.T) {
@@ -223,10 +105,9 @@ func TestEncodeDecodeEntry(t *testing.T) {
 // Cross-replica behavior
 // -----------------------------------------------------------------------
 
-// Two resolvers stand in for two gateway replicas: separate processes, one shared
-// Redis. Deduplicating a cold prefix across them is the reason the store's create
-// lock exists.
-func TestResolver_CrossReplica_SingleCreate(t *testing.T) {
+// Two resolvers stand in for two gateway replicas: separate processes, one shared Redis.
+// Once one replica has published a cache name, the other reuses it without calling Google.
+func TestResolver_CrossReplica_SecondResolveHitsStore(t *testing.T) {
 	expireISO := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
 	createResp := `{"name":"projects/p/locations/us-central1/cachedContents/new","expireTime":"` + expireISO + `","usageMetadata":{"totalTokenCount":512}}`
 	fake := newFakeCacheServer(t, `{"cachedContents":[]}`, createResp, http.StatusOK)
@@ -238,48 +119,93 @@ func TestResolver_CrossReplica_SingleCreate(t *testing.T) {
 		return resolverWithServer(fake.srv.URL, store)
 	}
 	a, b := newReplica(), newReplica()
-
-	req := func() *openai.ChatCompletionRequest {
-		return &openai.ChatCompletionRequest{
-			Model: "gemini-1.5-pro",
-			Messages: []openai.ChatCompletionMessageParamUnion{
-				systemMsg("You are helpful.", ephemeralFields()),
-				userMsg("Hello"),
-			},
-		}
-	}
 	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
 
-	var start, done sync.WaitGroup
-	start.Add(1)
-	results := make([]*ResolveResult, 2)
-	errs := make([]error, 2)
-	for i, r := range []*resolver{a, b} {
+	resA, err := a.Resolve(context.Background(), crossReplicaRequest(), auth)
+	require.NoError(t, err)
+	require.NotNil(t, resA)
+	assert.True(t, resA.Created)
+	assert.Equal(t, 512, resA.TokenCount)
+
+	resB, err := b.Resolve(context.Background(), crossReplicaRequest(), auth)
+	require.NoError(t, err)
+	require.NotNil(t, resB)
+	assert.Equal(t, resA.CacheName, resB.CacheName)
+	assert.False(t, resB.Created, "a store hit must not report a create")
+	assert.Equal(t, 0, resB.TokenCount)
+
+	assert.Equal(t, 1, fake.creates(), "the second replica must reuse the published cache")
+	assert.Equal(t, 0, fake.lists())
+}
+
+// Replicas that miss the same cold prefix at the same moment each create a cache. This is
+// the accepted cost of not coordinating: each replica keeps the cache it created, and each
+// reports the create so the duplicate write is visible in cache-write token metrics.
+func TestResolver_CrossReplica_ColdPrefixRaceMayDuplicate(t *testing.T) {
+	expireISO := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
+
+	// Hold every create until both replicas have issued one, so both miss the store.
+	const replicas = 2
+	var creates atomic.Int64
+	arrived := make(chan struct{}, replicas)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("unexpected %s: the request path must only create", r.Method)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		n := creates.Add(1)
+		arrived <- struct{}{}
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprintf(w, `{"name":"projects/p/locations/us-central1/cachedContents/new-%d","expireTime":"%s","usageMetadata":{"totalTokenCount":512}}`, n, expireISO)
+	}))
+	t.Cleanup(srv.Close)
+
+	mr := miniredis.RunT(t)
+	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
+
+	var done sync.WaitGroup
+	results := make([]*ResolveResult, replicas)
+	errs := make([]error, replicas)
+	for i := range replicas {
+		store, err := NewRedisStore(mr.Addr())
+		require.NoError(t, err)
+		r := resolverWithServer(srv.URL, store)
 		done.Add(1)
 		go func() {
 			defer done.Done()
-			start.Wait()
-			results[i], errs[i] = r.Resolve(context.Background(), req(), auth)
+			results[i], errs[i] = r.Resolve(context.Background(), crossReplicaRequest(), auth)
 		}()
 	}
-	start.Done()
+	for range replicas {
+		<-arrived
+	}
+	close(release)
 	done.Wait()
 
-	for i := range results {
+	assert.Equal(t, int64(replicas), creates.Load())
+	names := map[string]bool{}
+	for i, res := range results {
 		require.NoError(t, errs[i], "replica %d", i)
-		require.NotNil(t, results[i], "replica %d", i)
-		assert.Equal(t, "projects/p/locations/us-central1/cachedContents/new", results[i].CacheName)
+		require.NotNil(t, res, "replica %d", i)
+		assert.True(t, res.Created, "replica %d performed a create and must report it", i)
+		assert.Equal(t, 512, res.TokenCount, "replica %d", i)
+		names[res.CacheName] = true
 	}
-	assert.Equal(t, 1, fake.creates(), "two replicas sharing one Redis must create exactly one cache")
+	assert.Len(t, names, replicas, "each replica must keep the cache it created")
+}
 
-	// Only the replica that performed the write may bill for it.
-	created := 0
-	for _, res := range results {
-		if res.Created {
-			created++
-		}
+func crossReplicaRequest() *openai.ChatCompletionRequest {
+	return &openai.ChatCompletionRequest{
+		Model: "gemini-1.5-pro",
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			systemMsg("You are helpful.", ephemeralFields()),
+			userMsg("Hello"),
+		},
 	}
-	assert.Equal(t, 1, created, "exactly one replica may report Created")
 }
 
 // The failure policy: an unreachable store degrades caching, it does not fail requests.

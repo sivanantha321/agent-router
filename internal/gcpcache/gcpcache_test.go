@@ -158,9 +158,7 @@ func resolverWithServer(srvURL string, store ...CacheStore) *resolver {
 	}, s, nil).(*resolver)
 }
 
-// memStore is an in-process CacheStore for tests. It implements only the CacheStore
-// contract, not locker, so resolvers using it never coordinate — which is what the
-// no-op-store path does in production too.
+// memStore is an in-process CacheStore for tests.
 type memStore struct {
 	mu      sync.Mutex
 	entries map[string]entry
@@ -384,12 +382,15 @@ func TestResolver_CacheMiss_Creates(t *testing.T) {
 	assert.Equal(t, 512, res.TokenCount)
 	// remainder = messages after the breakpoint (index 0 → only userMsg at index 1 remains)
 	assert.Equal(t, []openai.ChatCompletionMessageParamUnion{userMsg("Hello")}, res.Messages)
-	// list → create → re-list (post-create convergence check)
-	assert.Equal(t, 2, fake.lists())
+	// The request path creates directly; it never lists.
+	assert.Equal(t, 0, fake.lists())
 	assert.Equal(t, 1, fake.creates())
 }
 
-func TestResolver_CacheHit_FromGoogleList(t *testing.T) {
+// A cache that exists in Google but not in the store is not discovered on the request
+// path: the resolver creates rather than scanning cachedContents. Repairing that drift is
+// the reconciler's job.
+func TestResolver_RequestPath_NeverLists(t *testing.T) {
 	req := &openai.ChatCompletionRequest{
 		Model: "gemini-1.5-pro",
 		Messages: []openai.ChatCompletionMessageParamUnion{
@@ -412,16 +413,18 @@ func TestResolver_CacheHit_FromGoogleList(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	fake := newFakeCacheServer(t, string(listBody), "", http.StatusOK)
+	createResp := `{"name":"projects/p/locations/us-central1/cachedContents/new","expireTime":"` + expireISO + `"}`
+	fake := newFakeCacheServer(t, string(listBody), createResp, http.StatusOK)
 	r := resolverWithServer(fake.srv.URL)
 	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
 
 	res, err := r.Resolve(context.Background(), req, auth)
 	require.NoError(t, err)
 	require.NotNil(t, res)
-	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/existing", res.CacheName)
-	assert.False(t, res.Created)
-	assert.Equal(t, 0, fake.creates())
+	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/new", res.CacheName)
+	assert.True(t, res.Created)
+	assert.Equal(t, 0, fake.lists(), "the request path must not list cachedContents")
+	assert.Equal(t, 1, fake.creates())
 }
 
 func TestResolver_StoreHit_SkipsGoogleAPICalls(t *testing.T) {
@@ -460,17 +463,8 @@ func TestResolver_StoreEntryExpiring_Refetches(t *testing.T) {
 	key := computeKeyForRequest(t, req)
 	expireISO := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
 
-	listBody, _ := json.Marshal(map[string]interface{}{
-		"cachedContents": []map[string]interface{}{
-			{
-				"name":        "projects/p/locations/us-central1/cachedContents/refreshed",
-				"displayName": key,
-				"model":       "publishers/google/models/gemini-1.5-pro",
-				"expireTime":  expireISO,
-			},
-		},
-	})
-	fake := newFakeCacheServer(t, string(listBody), "", http.StatusOK)
+	createResp := `{"name":"projects/p/locations/us-central1/cachedContents/refreshed","expireTime":"` + expireISO + `"}`
+	fake := newFakeCacheServer(t, `{"cachedContents":[]}`, createResp, http.StatusOK)
 	store := newMemStore()
 	r := resolverWithServer(fake.srv.URL, store)
 	// Seed with an entry expiring inside the stale window → must be treated as a miss.
@@ -481,7 +475,55 @@ func TestResolver_StoreEntryExpiring_Refetches(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, res)
 	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/refreshed", res.CacheName)
-	assert.Equal(t, 1, fake.lists(), "a near-expiry store entry must trigger a list call")
+	assert.Equal(t, 1, fake.creates(), "a near-expiry store entry must be treated as a miss")
+	assert.Equal(t, 0, fake.lists())
+
+	// The fresh entry replaces the stale one in the store.
+	e, ok, err := store.Get(context.Background(), key)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/refreshed", e.cacheName)
+}
+
+// A create response without an expireTime cannot be stored (its TTL would be negative),
+// so every later request would create again. It must fail instead of passing silently.
+func TestResolver_CreateExpiryMissing_Fails(t *testing.T) {
+	fake := newFakeCacheServer(t, `{"cachedContents":[]}`,
+		`{"name":"projects/p/locations/us-central1/cachedContents/x"}`, http.StatusOK)
+	store := newMemStore()
+	r := resolverWithServer(fake.srv.URL, store)
+	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
+	req := &openai.ChatCompletionRequest{
+		Model: "gemini-1.5-pro",
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			systemMsg("sys", ephemeralFields()),
+			userMsg("q"),
+		},
+	}
+
+	res, err := r.Resolve(context.Background(), req, auth)
+	require.Error(t, err)
+	assert.Nil(t, res)
+	assert.Contains(t, err.Error(), "no expireTime")
+}
+
+// An unparseable expireTime fails JSON decoding of the create response.
+func TestResolver_CreateExpiryUnparseable_Fails(t *testing.T) {
+	fake := newFakeCacheServer(t, `{"cachedContents":[]}`,
+		`{"name":"projects/p/locations/us-central1/cachedContents/x","expireTime":"not-a-time"}`, http.StatusOK)
+	r := resolverWithServer(fake.srv.URL)
+	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
+	req := &openai.ChatCompletionRequest{
+		Model: "gemini-1.5-pro",
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			systemMsg("sys", ephemeralFields()),
+			userMsg("q"),
+		},
+	}
+
+	res, err := r.Resolve(context.Background(), req, auth)
+	require.Error(t, err)
+	assert.Nil(t, res)
 }
 
 func TestResolver_CreateFailure_ReturnsError(t *testing.T) {
@@ -576,7 +618,10 @@ func TestResolver_TTLOverride_SentToGoogle(t *testing.T) {
 	assert.Equal(t, "3600s", body.TTL)
 }
 
-func TestResolver_DuplicateCreateRace_UsesListResult(t *testing.T) {
+// A replica keeps the cache it created, even if another replica created one for the same
+// key. The list handler would return the other replica's cache on any call, so a
+// reintroduced list (pre- or post-create) fails both the name and the list-count checks.
+func TestResolver_DuplicateCreateRace_KeepsOwnCreate(t *testing.T) {
 	req := &openai.ChatCompletionRequest{
 		Model: "gemini-1.5-pro",
 		Messages: []openai.ChatCompletionMessageParamUnion{
@@ -587,11 +632,7 @@ func TestResolver_DuplicateCreateRace_UsesListResult(t *testing.T) {
 	key := computeKeyForRequest(t, req)
 	expireISO := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
 
-	listCalls := 0
-	// First list: empty (cache not yet created by this replica).
-	// Create: returns "new-by-us".
-	// Second list (post-create): returns "older-by-other" — simulates another replica winning the race.
-	listBodyEmpty := `{"cachedContents":[]}`
+	var listCalls atomic.Int64
 	listBodyOther, _ := json.Marshal(map[string]interface{}{
 		"cachedContents": []map[string]interface{}{
 			{
@@ -607,16 +648,12 @@ func TestResolver_DuplicateCreateRace_UsesListResult(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Method {
 		case http.MethodGet:
-			listCalls++
+			listCalls.Add(1)
 			w.WriteHeader(http.StatusOK)
-			if listCalls == 1 {
-				_, _ = w.Write([]byte(listBodyEmpty))
-			} else {
-				_, _ = w.Write(listBodyOther)
-			}
+			_, _ = w.Write(listBodyOther)
 		case http.MethodPost:
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"name":"projects/p/locations/us-central1/cachedContents/new-by-us","expireTime":"` + expireISO + `"}`))
+			_, _ = w.Write([]byte(`{"name":"projects/p/locations/us-central1/cachedContents/new-by-us","expireTime":"` + expireISO + `","usageMetadata":{"totalTokenCount":512}}`))
 		}
 	}))
 	defer srv.Close()
@@ -626,8 +663,9 @@ func TestResolver_DuplicateCreateRace_UsesListResult(t *testing.T) {
 	res, err := r.Resolve(context.Background(), req, auth)
 	require.NoError(t, err)
 	require.NotNil(t, res)
-	// Resolver should prefer the entry from the post-create re-list (the other replica's entry).
-	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/older-by-other", res.CacheName)
-	// Created should be false when we converged to another replica's cache.
-	assert.False(t, res.Created)
+	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/new-by-us", res.CacheName)
+	// The replica performed and paid for the create, so it must report it.
+	assert.True(t, res.Created)
+	assert.Equal(t, 512, res.TokenCount)
+	assert.Equal(t, int64(0), listCalls.Load(), "the request path must not list cachedContents")
 }

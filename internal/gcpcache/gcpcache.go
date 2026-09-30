@@ -11,12 +11,13 @@
 //  2. Splits the request into a cached prefix (tools + system + messages up to the breakpoint)
 //     and a non-cached remainder.
 //  3. Generates a deterministic SHA-256 cache key and looks it up in the shared store.
-//  4. On a store miss, lists Google cachedContents for the target region and model.
-//  5. Creates the cache entry if not found, then returns the cache resource name and the
-//     non-cached messages.
+//  4. On a store miss, creates the cache entry, publishes it to the store, and returns
+//     the cache resource name and the non-cached messages.
 //
-// Concurrent resolutions of the same key are deduplicated by the store's create lock,
-// which coordinates across gateway replicas rather than only within one process.
+// The shared store deduplicates callers separated in time: once any replica publishes a
+// cache name, every replica reuses it. Replicas that miss the same cold prefix at the
+// same moment each create their own cache; this is tolerated, and each create is billed
+// and reported.
 //
 // The CacheResolver interface allows the implementation to be replaced with an external
 // cache service in the future without changing the request-path callers.
@@ -86,9 +87,10 @@ type CacheResolver interface {
 type resolver struct {
 	httpClient *http.Client
 
-	// store holds resolved cache names. It is shared across replicas when backed by
-	// Redis, which is what keeps two replicas from creating the same cache. Its
-	// failures are never fatal: they are logged and treated as a miss.
+	// store holds resolved cache names. Backed by Redis it is shared across replicas, so
+	// a name published by one is reused by all. It does not prevent simultaneous creates
+	// on a cold prefix. Its failures are never fatal: they are logged and treated as a
+	// miss.
 	store CacheStore
 
 	// logger records store failures, which are otherwise invisible because the request
@@ -157,9 +159,8 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 		}, nil
 	}
 
-	// Store miss — resolve against GCP. Concurrent resolutions of the same key are
-	// arbitrated by the store's create lock (see resolveUncached), which deduplicates
-	// across replicas rather than only within this one.
+	// Store miss — create against GCP. See resolveUncached for how concurrent
+	// resolutions of the same key behave.
 	result, err := r.resolveUncached(ctx, openAIReq, gcpAuth, cacheKey, ttl, contents, systemInstruction, geminiTools)
 	if err != nil {
 		return nil, err
@@ -171,14 +172,14 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 	return result, nil
 }
 
-// resolveUncached performs the GCP-side resolution for a cache key: list, create if
-// absent, then re-list to converge duplicate-create races. It deals only in the cached
-// prefix, so it leaves ResolveResult.Messages unset for the caller to fill in per-request.
+// resolveUncached creates a Google cachedContents entry for a cache key that missed the
+// store, and publishes it. It deals only in the cached prefix, so it leaves
+// ResolveResult.Messages unset for the caller to fill in per-request.
 //
-// Before creating, it claims a store-level lock so that replicas racing on a cold prefix
-// produce one create rather than N. Losing the race means waiting for the winner's result;
-// the wait degrading into a plain resolution is safe, because the list below is the actual
-// source of truth.
+// It neither waits on other replicas nor lists existing caches. Replicas that miss the
+// same cold prefix at the same moment each create; each keeps and bills its own cache
+// (Created is true, so the write shows up in cache-write token metrics), and the surplus
+// expires with its TTL.
 func (r *resolver) resolveUncached(
 	ctx context.Context,
 	openAIReq *openai.ChatCompletionRequest,
@@ -191,7 +192,6 @@ func (r *resolver) resolveUncached(
 	region := gcpAuth.GCPRegion()
 	project := gcpAuth.GCPProject()
 
-	// Get access token.
 	tokenSrc := gcpAuth.GCPTokenSource()
 	token, err := tokenSrc.Token()
 	if err != nil {
@@ -199,55 +199,13 @@ func (r *resolver) resolveUncached(
 	}
 	accessToken := token.AccessToken
 
-	// Claim the right to create this key. A replica that loses waits for the winner's
-	// result; if the winner never publishes one, it falls through and resolves itself.
-	locked := r.tryLock(ctx, cacheKey)
-	if !locked {
-		if e, ok := r.awaitLeader(ctx, cacheKey); ok {
-			return &ResolveResult{CacheName: e.cacheName, ExpireTime: e.expireTime}, nil
-		}
-	}
-
-	// List existing caches and match by displayName (cacheKey).
+	// Create without waiting on other replicas. A replica racing on the same cold prefix
+	// may create too; each keeps the cache it created, and the store holds whichever name
+	// was published last. Both are valid Google caches.
 	baseURL := fmt.Sprintf(gcpCachedContentsBasePath, region, project, region)
-	existingName, expireTime, err := r.listAndMatch(ctx, baseURL, accessToken, cacheKey, openAIReq.Model)
-	if err != nil {
-		if locked {
-			r.unlock(ctx, cacheKey)
-		}
-		return nil, fmt.Errorf("gcpcache: failed to list cached contents: %w", err)
-	}
-
-	if existingName != "" {
-		r.storeSet(ctx, cacheKey, entry{cacheName: existingName, expireTime: expireTime})
-		return &ResolveResult{
-			CacheName:  existingName,
-			ExpireTime: expireTime,
-		}, nil
-	}
-
-	// Cache not found — create it. A replica that did not win the lock still creates
-	// here, having already waited for the winner without result; this is the duplicate
-	// the lock narrows but cannot fully eliminate.
 	created, tokenCount, expireTime, err := r.createCache(ctx, baseURL, accessToken, openAIReq.Model, region, project, cacheKey, contents, systemInstruction, geminiTools, ttl)
 	if err != nil {
-		// Release the claim so waiters retry immediately rather than blocking for the
-		// remainder of the lock TTL on a create that will never publish.
-		if locked {
-			r.unlock(ctx, cacheKey)
-		}
 		return nil, fmt.Errorf("gcpcache: failed to create cached content: %w", err)
-	}
-
-	// After create, re-list and prefer the oldest match to converge duplicate-create races.
-	finalName, finalExpire, listErr := r.listAndMatch(ctx, baseURL, accessToken, cacheKey, openAIReq.Model)
-	if listErr == nil && finalName != "" && finalName != created {
-		// Another replica created a cache with the same key; use the one from the list.
-		r.storeSet(ctx, cacheKey, entry{cacheName: finalName, expireTime: finalExpire})
-		return &ResolveResult{
-			CacheName:  finalName,
-			ExpireTime: finalExpire,
-		}, nil
 	}
 
 	r.storeSet(ctx, cacheKey, entry{cacheName: created, expireTime: expireTime})
@@ -301,52 +259,6 @@ func (r *resolver) storeSet(ctx context.Context, key string, e entry) {
 		r.logger.Warn("gcpcache: cache store write failed",
 			slog.String("error", err.Error()))
 	}
-}
-
-// locker is implemented by stores that can arbitrate cache creation across replicas.
-// Stores that cannot (such as the no-op store) simply never grant a lock, which leaves
-// every caller resolving independently — correct, just without the deduplication.
-type locker interface {
-	tryLock(ctx context.Context, key string) (bool, error)
-	unlock(ctx context.Context, key string)
-	awaitLeader(ctx context.Context, key string) (entry, bool, error)
-}
-
-// tryLock claims the right to create key. It reports false when the store cannot lock,
-// when the lock is held elsewhere, or on failure — all cases where the caller should
-// resolve against Google rather than wait.
-func (r *resolver) tryLock(ctx context.Context, key string) bool {
-	l, ok := r.store.(locker)
-	if !ok {
-		return false
-	}
-	won, err := l.tryLock(ctx, key)
-	if err != nil {
-		r.logger.Warn("gcpcache: cache store lock failed, proceeding without coordination",
-			slog.String("error", err.Error()))
-		return false
-	}
-	return won
-}
-
-func (r *resolver) unlock(ctx context.Context, key string) {
-	if l, ok := r.store.(locker); ok {
-		l.unlock(ctx, key)
-	}
-}
-
-// awaitLeader waits for the replica holding the lock to publish its result.
-func (r *resolver) awaitLeader(ctx context.Context, key string) (entry, bool) {
-	l, ok := r.store.(locker)
-	if !ok {
-		return entry{}, false
-	}
-	e, found, err := l.awaitLeader(ctx, key)
-	if err != nil {
-		// Includes the timeout case: fall through and resolve rather than fail.
-		return entry{}, false
-	}
-	return e, found
 }
 
 // -----------------------------------------------------------------------
@@ -504,70 +416,6 @@ func computeCacheKey(model string, contents []genai.Content, systemInstruction *
 // Google cachedContents REST API calls
 // -----------------------------------------------------------------------
 
-// cachedContentItem is the subset of the cachedContents list item we care about.
-type cachedContentItem struct {
-	Name        string `json:"name"`
-	DisplayName string `json:"displayName"`
-	ExpireTime  string `json:"expireTime"` // RFC 3339
-	Model       string `json:"model"`
-}
-
-type listResponse struct {
-	CachedContents []cachedContentItem `json:"cachedContents"`
-}
-
-// listAndMatch lists cachedContents for the given region+project and returns the
-// name of the first entry whose displayName matches cacheKey and whose model
-// suffix matches the requested model. Returns ("", zero, nil) when not found.
-func (r *resolver) listAndMatch(ctx context.Context, baseURL, accessToken, cacheKey, model string) (string, time.Time, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL, nil)
-	if err != nil {
-		return "", time.Time{}, err
-	}
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-
-	resp, err := r.httpClient.Do(req)
-	if err != nil {
-		return "", time.Time{}, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", time.Time{}, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", time.Time{}, fmt.Errorf("list cachedContents returned HTTP %d: %s", resp.StatusCode, body)
-	}
-
-	var lr listResponse
-	if err = json.Unmarshal(body, &lr); err != nil {
-		return "", time.Time{}, fmt.Errorf("failed to decode list response: %w", err)
-	}
-
-	for _, item := range lr.CachedContents {
-		if item.DisplayName != cacheKey {
-			continue
-		}
-		// Model in the item is the full resource name; check the suffix.
-		if !modelMatchesSuffix(item.Model, model) {
-			continue
-		}
-		expireTime, _ := time.Parse(time.RFC3339, item.ExpireTime)
-		return item.Name, expireTime, nil
-	}
-	return "", time.Time{}, nil
-}
-
-// modelMatchesSuffix checks whether the full model resource name ends with the
-// requested short model name (e.g. "publishers/google/models/gemini-1.5-pro").
-func modelMatchesSuffix(fullModel, shortModel string) bool {
-	if fullModel == shortModel {
-		return true
-	}
-	suffix := "models/" + shortModel
-	return len(fullModel) >= len(suffix) && fullModel[len(fullModel)-len(suffix):] == suffix
-}
-
 // createCache creates a cached content in GCP and returns the new cache's resource name,
 // token count, and expiry time.
 func (r *resolver) createCache(
@@ -617,6 +465,11 @@ func (r *resolver) createCache(
 	var cr gcp.CachedContent
 	if err = json.Unmarshal(respBody, &cr); err != nil {
 		return "", 0, time.Time{}, fmt.Errorf("failed to decode create cache response: %w", err)
+	}
+	// A zero expiry would make storeSet skip the write, so every later request for this
+	// prefix would create again with nothing logged. Fail visibly instead.
+	if cr.ExpireTime.IsZero() {
+		return "", 0, time.Time{}, fmt.Errorf("create cachedContent response has no expireTime: %s", respBody)
 	}
 
 	if cr.UsageMetadata != nil {
