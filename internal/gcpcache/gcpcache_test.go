@@ -22,6 +22,7 @@ import (
 
 	"github.com/envoyproxy/ai-gateway/internal/apischema/gcp"
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
+	"github.com/envoyproxy/ai-gateway/internal/contextcache"
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 	"github.com/envoyproxy/ai-gateway/internal/json"
@@ -146,9 +147,9 @@ func (t *redirectTransport) RoundTrip(req *http.Request) (*http.Response, error)
 
 // resolverWithServer builds a resolver pointed at a fake Google server. An optional store
 // may be supplied; with none, the no-op store applies and every lookup misses.
-func resolverWithServer(srvURL string, store ...CacheStore) *resolver {
+func resolverWithServer(srvURL string, store ...contextcache.Store) *resolver {
 	host := srvURL[len("http://"):]
-	var s CacheStore
+	var s contextcache.Store
 	if len(store) > 0 {
 		s = store[0]
 	}
@@ -158,10 +159,10 @@ func resolverWithServer(srvURL string, store ...CacheStore) *resolver {
 	}, s, nil).(*resolver)
 }
 
-// memStore is an in-process CacheStore for tests.
+// memStore is an in-process contextcache.Store for tests.
 type memStore struct {
 	mu      sync.Mutex
-	entries map[string]entry
+	entries map[string]contextcache.Entry
 	// getErr, when set, is returned from every Get, standing in for an unreachable store.
 	getErr error
 	// setErr, when set, is returned from every Set.
@@ -170,12 +171,12 @@ type memStore struct {
 	sets   atomic.Int64
 }
 
-func newMemStore() *memStore { return &memStore{entries: map[string]entry{}} }
+func newMemStore() *memStore { return &memStore{entries: map[string]contextcache.Entry{}} }
 
-func (m *memStore) Get(_ context.Context, key string) (entry, bool, error) {
+func (m *memStore) Get(_ context.Context, key string) (contextcache.Entry, bool, error) {
 	m.gets.Add(1)
 	if m.getErr != nil {
-		return entry{}, false, m.getErr
+		return contextcache.Entry{}, false, m.getErr
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -183,7 +184,7 @@ func (m *memStore) Get(_ context.Context, key string) (entry, bool, error) {
 	return e, ok, nil
 }
 
-func (m *memStore) Set(_ context.Context, key string, e entry, _ time.Duration) error {
+func (m *memStore) Set(_ context.Context, key string, e contextcache.Entry, _ time.Duration) error {
 	m.sets.Add(1)
 	if m.setErr != nil {
 		return m.setErr
@@ -197,7 +198,7 @@ func (m *memStore) Set(_ context.Context, key string, e entry, _ time.Duration) 
 func (m *memStore) seed(key, cacheName string, expireTime time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.entries[key] = entry{cacheName: cacheName, expireTime: expireTime}
+	m.entries[key] = contextcache.Entry{Name: cacheName, ExpireTime: expireTime}
 }
 
 // computeKeyForRequest replicates the key generation for use in test assertions.
@@ -482,7 +483,7 @@ func TestResolver_StoreEntryExpiring_Refetches(t *testing.T) {
 	e, ok, err := store.Get(context.Background(), key)
 	require.NoError(t, err)
 	require.True(t, ok)
-	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/refreshed", e.cacheName)
+	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/refreshed", e.Name)
 }
 
 // A create response without an expireTime cannot be stored (its TTL would be negative),

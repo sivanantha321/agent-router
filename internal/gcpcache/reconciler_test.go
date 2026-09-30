@@ -15,11 +15,33 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/envoyproxy/ai-gateway/internal/contextcache"
 )
 
 var reconcileAuth = &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
+
+// newTestRedisStore starts an in-process Redis and returns a store pointed at it.
+func newTestRedisStore(t *testing.T) (contextcache.ReconcileStore, *miniredis.Miniredis) {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	s, err := contextcache.NewRedisStore(mr.Addr())
+	require.NoError(t, err)
+	return s, mr
+}
+
+// reconcileOnce runs one round for auth against r's store and returns its stats and the
+// number of list pages read.
+func reconcileOnce(t *testing.T, r *resolver, auth *fakeGCPAuth) (contextcache.Stats, int, error) {
+	t.Helper()
+	rc, ok := r.newReconciler(auth, time.Minute)
+	require.True(t, ok)
+	stats, err := rc.RunOnce(context.Background())
+	return stats, rc.Source.(*listSource).pages, err
+}
 
 func testKey(n int) string { return fmt.Sprintf("%064x", n) }
 
@@ -60,10 +82,10 @@ func TestReconcile_MultiPageWalkWritesEveryEntry(t *testing.T) {
 	store, _ := newTestRedisStore(t)
 	r := resolverWithServer(srv.URL, store)
 
-	stats, err := r.reconcileOnce(context.Background(), store, reconcileAuth, time.Minute)
+	stats, pages, err := reconcileOnce(t, r, reconcileAuth)
 	require.NoError(t, err)
-	assert.Equal(t, 2, stats.pages)
-	assert.Equal(t, 2, stats.written)
+	assert.Equal(t, 2, pages)
+	assert.Equal(t, 2, stats.Written)
 	assert.Equal(t, int64(2), calls.Load())
 	for _, q := range *queries {
 		assert.Contains(t, q, "pageSize=1000")
@@ -72,7 +94,7 @@ func TestReconcile_MultiPageWalkWritesEveryEntry(t *testing.T) {
 		e, ok, err := store.Get(context.Background(), testKey(n))
 		require.NoError(t, err)
 		require.True(t, ok, "key %d", n)
-		assert.Equal(t, name, e.cacheName)
+		assert.Equal(t, name, e.Name)
 	}
 }
 
@@ -82,14 +104,14 @@ func TestReconcile_DoesNotOverwriteExistingEntry(t *testing.T) {
 		"": `{"cachedContents":[` + itemJSON(testKey(1), "c/from-list", exp) + `]}`,
 	})
 	store, _ := newTestRedisStore(t)
-	require.NoError(t, store.Set(context.Background(), testKey(1), entry{cacheName: "c/published", expireTime: exp}, time.Minute))
+	require.NoError(t, store.Set(context.Background(), testKey(1), contextcache.Entry{Name: "c/published", ExpireTime: exp}, time.Minute))
 	r := resolverWithServer(srv.URL, store)
 
-	stats, err := r.reconcileOnce(context.Background(), store, reconcileAuth, time.Minute)
+	stats, _, err := reconcileOnce(t, r, reconcileAuth)
 	require.NoError(t, err)
-	assert.Equal(t, 0, stats.written)
+	assert.Equal(t, 0, stats.Written)
 	e, _, _ := store.Get(context.Background(), testKey(1))
-	assert.Equal(t, "c/published", e.cacheName, "reconciler must not clobber a request's write")
+	assert.Equal(t, "c/published", e.Name, "reconciler must not clobber a request's write")
 }
 
 func TestReconcile_PageLimitStopsEndlessChain(t *testing.T) {
@@ -102,9 +124,9 @@ func TestReconcile_PageLimitStopsEndlessChain(t *testing.T) {
 	store, _ := newTestRedisStore(t)
 	r := resolverWithServer(srv.URL, store)
 
-	stats, err := r.reconcileOnce(context.Background(), store, reconcileAuth, time.Minute)
+	_, pages, err := reconcileOnce(t, r, reconcileAuth)
 	require.NoError(t, err)
-	assert.Equal(t, listMaxPages, stats.pages)
+	assert.Equal(t, listMaxPages, pages)
 	assert.Equal(t, int64(listMaxPages), calls.Load())
 }
 
@@ -116,7 +138,7 @@ func TestReconcile_RepeatedTokenEndsWalk(t *testing.T) {
 	store, _ := newTestRedisStore(t)
 	r := resolverWithServer(srv.URL, store)
 
-	_, err := r.reconcileOnce(context.Background(), store, reconcileAuth, time.Minute)
+	_, _, err := reconcileOnce(t, r, reconcileAuth)
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), calls.Load())
 }
@@ -124,24 +146,24 @@ func TestReconcile_RepeatedTokenEndsWalk(t *testing.T) {
 func TestReconcile_GateSkipsSecondReplica(t *testing.T) {
 	srv, calls, _ := newListServer(t, map[string]string{"": `{"cachedContents":[]}`})
 	store, mr := newTestRedisStore(t)
-	second, err := NewRedisStore(mr.Addr())
+	second, err := contextcache.NewRedisStore(mr.Addr())
 	require.NoError(t, err)
 	a := resolverWithServer(srv.URL, store)
 	b := resolverWithServer(srv.URL, second)
 
-	statsA, err := a.reconcileOnce(context.Background(), store, reconcileAuth, time.Minute)
+	statsA, _, err := reconcileOnce(t, a, reconcileAuth)
 	require.NoError(t, err)
-	assert.False(t, statsA.gated)
-	statsB, err := b.reconcileOnce(context.Background(), second.(*redisStore), reconcileAuth, time.Minute)
+	assert.False(t, statsA.Gated)
+	statsB, _, err := reconcileOnce(t, b, reconcileAuth)
 	require.NoError(t, err)
-	assert.True(t, statsB.gated)
+	assert.True(t, statsB.Gated)
 	assert.Equal(t, int64(1), calls.Load())
 
 	// Once the interval passes, a replica may reconcile again.
 	mr.FastForward(time.Minute + time.Second)
-	statsB, err = b.reconcileOnce(context.Background(), second.(*redisStore), reconcileAuth, time.Minute)
+	statsB, _, err = reconcileOnce(t, b, reconcileAuth)
 	require.NoError(t, err)
-	assert.False(t, statsB.gated)
+	assert.False(t, statsB.Gated)
 }
 
 func TestReconcile_GateIsPerProjectRegion(t *testing.T) {
@@ -150,11 +172,11 @@ func TestReconcile_GateIsPerProjectRegion(t *testing.T) {
 	r := resolverWithServer(srv.URL, store)
 	other := &fakeGCPAuth{token: "tok", region: "europe-west1", project: "p"}
 
-	_, err := r.reconcileOnce(context.Background(), store, reconcileAuth, time.Minute)
+	_, _, err := reconcileOnce(t, r, reconcileAuth)
 	require.NoError(t, err)
-	stats, err := r.reconcileOnce(context.Background(), store, other, time.Minute)
+	stats, _, err := reconcileOnce(t, r, other)
 	require.NoError(t, err)
-	assert.False(t, stats.gated, "one region's round must not suppress another's")
+	assert.False(t, stats.Gated, "one region's round must not suppress another's")
 	assert.Equal(t, int64(2), calls.Load())
 }
 
@@ -170,11 +192,13 @@ func TestReconcile_SkipsForeignExpiredAndUnparseable(t *testing.T) {
 	store, mr := newTestRedisStore(t)
 	r := resolverWithServer(srv.URL, store)
 
-	stats, err := r.reconcileOnce(context.Background(), store, reconcileAuth, time.Minute)
+	stats, _, err := reconcileOnce(t, r, reconcileAuth)
 	require.NoError(t, err)
-	assert.Equal(t, 4, stats.seen)
-	assert.Equal(t, 1, stats.written)
-	assert.Equal(t, 3, stats.skipped)
+	// Foreign and unparseable items are dropped by the source; the near-expiry one is
+	// seen but not written.
+	assert.Equal(t, 2, stats.Seen)
+	assert.Equal(t, 1, stats.Written)
+	assert.Equal(t, 1, stats.Skipped)
 	assert.False(t, mr.Exists("my-own-cache"))
 	assert.False(t, mr.Exists(testKey(1)))
 	assert.False(t, mr.Exists(testKey(2)))
@@ -187,12 +211,12 @@ func TestReconcile_EntryTTLMatchesExpiry(t *testing.T) {
 	store, mr := newTestRedisStore(t)
 	r := resolverWithServer(srv.URL, store)
 
-	_, err := r.reconcileOnce(context.Background(), store, reconcileAuth, time.Minute)
+	_, _, err := reconcileOnce(t, r, reconcileAuth)
 	require.NoError(t, err)
 	assert.InDelta(t, (5 * time.Minute).Seconds(), mr.TTL(testKey(1)).Seconds(), 5)
 }
 
-func TestReconcile_ListFailureReturnsErrorWithoutPanicking(t *testing.T) {
+func TestReconcile_ListFailureReturnsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -200,42 +224,14 @@ func TestReconcile_ListFailureReturnsErrorWithoutPanicking(t *testing.T) {
 	store, _ := newTestRedisStore(t)
 	r := resolverWithServer(srv.URL, store)
 
-	_, err := r.reconcileOnce(context.Background(), store, reconcileAuth, time.Minute)
+	_, _, err := reconcileOnce(t, r, reconcileAuth)
 	require.ErrorContains(t, err, "HTTP 500")
-	// reconcileRound is the caller the loop uses; it must swallow the error.
-	r.reconcileRound(context.Background(), store, reconcileAuth, time.Minute)
 }
 
-func TestRunReconciler_NoopStoreReturnsImmediately(t *testing.T) {
+func TestNewReconciler_NoopStoreHasNone(t *testing.T) {
 	r := New(nil, nil, nil).(*resolver)
-	done := make(chan struct{})
-	go func() {
-		r.runReconciler(context.Background(), reconcileAuth, time.Minute)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("runReconciler must return at once for a store that cannot reconcile")
-	}
-}
-
-func TestRunReconciler_StopsOnContextCancel(t *testing.T) {
-	srv, _, _ := newListServer(t, map[string]string{"": `{"cachedContents":[]}`})
-	store, _ := newTestRedisStore(t)
-	r := resolverWithServer(srv.URL, store)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		r.runReconciler(ctx, reconcileAuth, time.Hour)
-		close(done)
-	}()
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("runReconciler must return when its context is cancelled")
-	}
+	_, ok := r.newReconciler(reconcileAuth, time.Minute)
+	assert.False(t, ok, "a store that cannot reconcile must not get a reconciler")
 }
 
 func TestIsCacheKey(t *testing.T) {

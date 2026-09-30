@@ -38,6 +38,7 @@ import (
 
 	"github.com/envoyproxy/ai-gateway/internal/apischema/gcp"
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
+	"github.com/envoyproxy/ai-gateway/internal/contextcache"
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
 	"github.com/envoyproxy/ai-gateway/internal/json"
 	"github.com/envoyproxy/ai-gateway/internal/translator"
@@ -49,11 +50,6 @@ const (
 
 	// gcpCachedContentsBasePath is the base URL for the Vertex AI cachedContents REST API.
 	gcpCachedContentsBasePath = "https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/cachedContents"
-
-	// staleThreshold is how close to its expiry a stored entry must be before it is
-	// treated as a miss, so there is time to re-resolve before the Google cache
-	// disappears underneath an in-flight request.
-	staleThreshold = 10 * time.Second
 )
 
 // ResolveResult holds the outcome of a successful cache resolution.
@@ -91,7 +87,7 @@ type resolver struct {
 	// a name published by one is reused by all. It does not prevent simultaneous creates
 	// on a cold prefix. Its failures are never fatal: they are logged and treated as a
 	// miss.
-	store CacheStore
+	store contextcache.Store
 
 	// logger records store failures, which are otherwise invisible because the request
 	// proceeds normally.
@@ -103,12 +99,12 @@ type resolver struct {
 // httpClient is used for calls to the Google cachedContents API; pass nil for a default.
 // store holds resolved cache names; pass nil to disable caching entirely, which makes
 // resolution inert rather than failing requests. logger may be nil.
-func New(httpClient *http.Client, store CacheStore, logger *slog.Logger) CacheResolver {
+func New(httpClient *http.Client, store contextcache.Store, logger *slog.Logger) CacheResolver {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
 	if store == nil {
-		store = noopStore{}
+		store = contextcache.NoopStore{}
 	}
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
@@ -153,9 +149,9 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 	// request. Google-side failures below are a different matter and do fail fast.
 	if e, ok := r.storeGet(ctx, cacheKey); ok {
 		return &ResolveResult{
-			CacheName:  e.cacheName,
+			CacheName:  e.Name,
 			Messages:   remainderMessages,
-			ExpireTime: e.expireTime,
+			ExpireTime: e.ExpireTime,
 		}, nil
 	}
 
@@ -208,7 +204,7 @@ func (r *resolver) resolveUncached(
 		return nil, fmt.Errorf("gcpcache: failed to create cached content: %w", err)
 	}
 
-	r.storeSet(ctx, cacheKey, entry{cacheName: created, expireTime: expireTime})
+	r.storeSet(ctx, cacheKey, contextcache.Entry{Name: created, ExpireTime: expireTime})
 	return &ResolveResult{
 		CacheName:  created,
 		Created:    true,
@@ -230,28 +226,28 @@ func (r *resolver) resolveUncached(
 // -----------------------------------------------------------------------
 
 // storeGet reads a resolved cache name, reporting a miss on any failure.
-func (r *resolver) storeGet(ctx context.Context, key string) (entry, bool) {
+func (r *resolver) storeGet(ctx context.Context, key string) (contextcache.Entry, bool) {
 	e, ok, err := r.store.Get(ctx, key)
 	if err != nil {
 		r.logger.Warn("gcpcache: cache store read failed, proceeding uncached",
 			slog.String("error", err.Error()))
-		return entry{}, false
+		return contextcache.Entry{}, false
 	}
 	if !ok {
-		return entry{}, false
+		return contextcache.Entry{}, false
 	}
 	// Treat entries expiring within 10s as stale so there is time to re-resolve before
 	// the cache disappears underneath an in-flight request.
-	if time.Until(e.expireTime) < staleThreshold {
-		return entry{}, false
+	if time.Until(e.ExpireTime) < contextcache.StaleThreshold {
+		return contextcache.Entry{}, false
 	}
 	return e, true
 }
 
 // storeSet records a resolved cache name, expiring it with the Google entry itself so
 // the store cannot outlive what it points at.
-func (r *resolver) storeSet(ctx context.Context, key string, e entry) {
-	ttl := time.Until(e.expireTime)
+func (r *resolver) storeSet(ctx context.Context, key string, e contextcache.Entry) {
+	ttl := time.Until(e.ExpireTime)
 	if ttl <= 0 {
 		return
 	}

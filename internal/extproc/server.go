@@ -26,6 +26,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/envoyproxy/ai-gateway/internal/backendauth"
+	"github.com/envoyproxy/ai-gateway/internal/contextcache"
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
 	"github.com/envoyproxy/ai-gateway/internal/gcpcache"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
@@ -115,7 +116,7 @@ func (s *Server) LoadConfig(ctx context.Context, config *filterapi.Config) error
 		key := rb.Backend.Name + "|" + cc.URL
 		resolver, ok := s.cacheResolvers[key]
 		if !ok {
-			store, err := gcpcache.NewRedisStore(cc.URL)
+			store, err := contextcache.NewRedisStore(cc.URL)
 			if err != nil {
 				// A bad URL disables caching for this backend rather than failing the
 				// reload: the store is an optimization, and rejecting the whole config
