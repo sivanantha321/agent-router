@@ -334,6 +334,21 @@ func TestTranslateOpenAItoAnthropicTools(t *testing.T) {
 			expectErr: true,
 		},
 		{
+			name: "maps Anthropic web search tool",
+			openAIReq: &openai.ChatCompletionRequest{
+				Tools: []openai.Tool{{
+					Type: openai.ToolTypeAnthropicWebSearch,
+					Name: "web_search",
+				}},
+			},
+			expectedTools: []anthropic.ToolUnionParam{{
+				OfWebSearchTool20260209: &anthropic.WebSearchTool20260209Param{
+					Name: constant.WebSearch("web_search"),
+					Type: constant.WebSearch20260209("web_search_20260209"),
+				},
+			}},
+		},
+		{
 			name: "tool definition without type field",
 			openAIReq: &openai.ChatCompletionRequest{
 				Tools: []openai.Tool{
@@ -505,11 +520,11 @@ func TestTranslateOpenAItoAnthropicTools(t *testing.T) {
 					require.Equal(t, tt.expectedTools[0].GetName(), tools[0].GetName())
 					require.Equal(t, tt.expectedTools[0].GetType(), tools[0].GetType())
 					require.Equal(t, tt.expectedTools[0].GetDescription(), tools[0].GetDescription())
-					if tt.expectedTools[0].GetInputSchema().Properties != nil {
-						require.Equal(t, tt.expectedTools[0].GetInputSchema().Properties, tools[0].GetInputSchema().Properties)
+					if inputSchema := tt.expectedTools[0].GetInputSchema(); inputSchema != nil && inputSchema.Properties != nil {
+						require.Equal(t, inputSchema.Properties, tools[0].GetInputSchema().Properties)
 					}
-					if tt.expectedTools[0].GetInputSchema().ExtraFields != nil {
-						require.Equal(t, tt.expectedTools[0].GetInputSchema().ExtraFields, tools[0].GetInputSchema().ExtraFields)
+					if inputSchema := tt.expectedTools[0].GetInputSchema(); inputSchema != nil && inputSchema.ExtraFields != nil {
+						require.Equal(t, inputSchema.ExtraFields, tools[0].GetInputSchema().ExtraFields)
 					}
 				}
 			}
@@ -813,6 +828,30 @@ func TestOutputConfigAvailable(t *testing.T) {
 			name:      "claude-fable-5 not supported on AWS",
 			apiSchema: filterapi.APISchemaAWSAnthropic,
 			model:     "claude-fable-5",
+			expected:  false,
+		},
+		{
+			name:      "claude-opus-5 supported on GCP",
+			apiSchema: filterapi.APISchemaGCPAnthropic,
+			model:     "claude-opus-5",
+			expected:  true,
+		},
+		{
+			name:      "claude-opus-5 not supported on AWS",
+			apiSchema: filterapi.APISchemaAWSAnthropic,
+			model:     "claude-opus-5",
+			expected:  false,
+		},
+		{
+			name:      "claude-opus-5-5 supported on GCP",
+			apiSchema: filterapi.APISchemaGCPAnthropic,
+			model:     "claude-opus-5-5",
+			expected:  true,
+		},
+		{
+			name:      "claude-opus-5-5 not supported on AWS",
+			apiSchema: filterapi.APISchemaAWSAnthropic,
+			model:     "claude-opus-5-5",
 			expected:  false,
 		},
 		// Unsupported models on either backend.
@@ -1224,6 +1263,16 @@ func TestEffortAvailable(t *testing.T) {
 		{
 			name:     "claude-mythos-preview supported",
 			model:    "claude-mythos-preview",
+			expected: true,
+		},
+		{
+			name:     "claude-opus-5 supported",
+			model:    "claude-opus-5",
+			expected: true,
+		},
+		{
+			name:     "claude-opus-5-5 supported",
+			model:    "claude-opus-5-5",
 			expected: true,
 		},
 		{

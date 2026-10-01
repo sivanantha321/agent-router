@@ -172,6 +172,16 @@ func translateOpenAItoAnthropicTools(openAITools []openai.Tool, openAIToolChoice
 	if len(openAITools) > 0 {
 		anthropicTools := make([]anthropic.ToolUnionParam, 0, len(openAITools))
 		for _, openAITool := range openAITools {
+			if openAITool.Type == openai.ToolTypeAnthropicWebSearch {
+				anthropicTools = append(anthropicTools, anthropic.ToolUnionParam{
+					OfWebSearchTool20260209: &anthropic.WebSearchTool20260209Param{
+						Name: constant.WebSearch(openAITool.Name),
+						Type: constant.WebSearch20260209(openAITool.Type),
+					},
+				})
+				continue
+			}
+
 			if openAITool.Type != openai.ToolTypeFunction {
 				err = fmt.Errorf("%w: unsupported tool type: %s", internalapi.ErrInvalidRequestBody, openAITool.Type)
 				return
@@ -205,9 +215,9 @@ func translateOpenAItoAnthropicTools(openAITools []openai.Tool, openAIToolChoice
 			}
 
 			anthropicTools = append(anthropicTools, anthropic.ToolUnionParam{OfTool: &toolParam})
-			if len(anthropicTools) > 0 {
-				tools = anthropicTools
-			}
+		}
+		if len(anthropicTools) > 0 {
+			tools = anthropicTools
 		}
 
 		// 2. Handle the tool_choice parameter.
@@ -643,9 +653,10 @@ var awsOutputConfigModels = []string{
 }
 
 // gcpOutputConfigModels lists model identifiers that support structured outputs
-// on GCP Vertex AI: Claude Fable 5, Claude Mythos 5, Claude Opus 4.8, Claude
-// Mythos Preview, Claude Opus 4.7, Claude Opus 4.6, Claude Sonnet 5, Claude
-// Sonnet 4.6, Claude Sonnet 4.5, Claude Opus 4.5, and Claude Haiku 4.5.
+// on GCP Vertex AI: Claude Fable 5, Claude Mythos 5, Claude Opus 5.5,
+// Claude Opus 5, Claude Opus 4.8, Claude Mythos Preview, Claude Opus 4.7,
+// Claude Opus 4.6, Claude Sonnet 5, Claude Sonnet 4.6, Claude Sonnet 4.5,
+// Claude Opus 4.5, and Claude Haiku 4.5.
 var gcpOutputConfigModels = []string{
 	"opus-4-5",       // Claude Opus 4.5
 	"sonnet-4-5",     // Claude Sonnet 4.5
@@ -654,6 +665,8 @@ var gcpOutputConfigModels = []string{
 	"sonnet-4-6",     // Claude Sonnet 4.6
 	"opus-4-7",       // Claude Opus 4.7
 	"opus-4-8",       // Claude Opus 4.8
+	"opus-5",         // Claude Opus 5
+	"opus-5-5",       // Claude Opus 5.5
 	"sonnet-5",       // Claude Sonnet 5
 	"fable-5",        // Claude Fable 5
 	"mythos-5",       // Claude Mythos 5
@@ -672,14 +685,18 @@ func outputConfigAvailable(apiSchema filterapi.APISchemaName, model internalapi.
 }
 
 // effortModels lists model identifiers that support the output_config.effort parameter.
-// The effort parameter is supported by Claude Fable 5, Claude Mythos 5, Claude Opus 4.8, Claude Mythos Preview,
-// Claude Opus 4.7, Claude Opus 4.6, Claude Sonnet 5, Claude Sonnet 4.6, and Claude Opus 4.5.
+// The effort parameter is supported by Claude Fable 5, Claude Mythos 5,
+// Claude Opus 5.5, Claude Opus 5, Claude Opus 4.8, Claude Mythos Preview,
+// Claude Opus 4.7, Claude Opus 4.6, Claude Sonnet 5, Claude Sonnet 4.6,
+// and Claude Opus 4.5.
 // See: https://platform.claude.com/docs/en/build-with-claude/effort
 var effortModels = []string{
 	"opus-4-5",       // Claude Opus 4.5
 	"opus-4-6",       // Claude Opus 4.6
 	"opus-4-7",       // Claude Opus 4.7
 	"opus-4-8",       // Claude Opus 4.8
+	"opus-5",         // Claude Opus 5
+	"opus-5-5",       // Claude Opus 5.5
 	"sonnet-4-6",     // Claude Sonnet 4.6
 	"sonnet-5",       // Claude Sonnet 5
 	"fable-5",        // Claude Fable 5
