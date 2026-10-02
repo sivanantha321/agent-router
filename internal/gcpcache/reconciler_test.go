@@ -25,7 +25,7 @@ import (
 var reconcileAuth = &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
 
 // newTestRedisStore starts an in-process Redis and returns a store pointed at it.
-func newTestRedisStore(t *testing.T) (contextcache.ReconcileStore, *miniredis.Miniredis) {
+func newTestRedisStore(t *testing.T) (contextcache.Store, *miniredis.Miniredis) {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	s, err := contextcache.NewRedisStore(mr.Addr())
@@ -37,8 +37,7 @@ func newTestRedisStore(t *testing.T) (contextcache.ReconcileStore, *miniredis.Mi
 // number of list pages read.
 func reconcileOnce(t *testing.T, r *resolver, auth *fakeGCPAuth) (contextcache.Stats, int, error) {
 	t.Helper()
-	rc, ok := r.newReconciler(auth, time.Minute)
-	require.True(t, ok)
+	rc := r.newReconciler(auth, time.Minute)
 	stats, err := rc.RunOnce(context.Background())
 	return stats, rc.Source.(*listSource).pages, err
 }
@@ -228,10 +227,15 @@ func TestReconcile_ListFailureReturnsError(t *testing.T) {
 	require.ErrorContains(t, err, "HTTP 500")
 }
 
-func TestNewReconciler_NoopStoreHasNone(t *testing.T) {
-	r := New(nil, nil, nil).(*resolver)
-	_, ok := r.newReconciler(reconcileAuth, time.Minute)
-	assert.False(t, ok, "a store that cannot reconcile must not get a reconciler")
+// A no-op store never wins the gate, so its rounds never list the provider.
+func TestReconcile_NoopStoreIsGatedAndNeverLists(t *testing.T) {
+	srv, calls, _ := newListServer(t, map[string]string{"": `{"cachedContents":[]}`})
+	r := resolverWithServer(srv.URL)
+
+	stats, _, err := reconcileOnce(t, r, reconcileAuth)
+	require.NoError(t, err)
+	assert.True(t, stats.Gated)
+	assert.Equal(t, int64(0), calls.Load())
 }
 
 func TestIsCacheKey(t *testing.T) {
@@ -290,9 +294,13 @@ func TestResolver_CloseIsIdempotentAndBlocksLaterStart(t *testing.T) {
 	assert.Equal(t, int64(0), calls.Load())
 }
 
-func TestResolver_StartWithNoopStoreDoesNothing(t *testing.T) {
+func TestResolver_StartWithNoopStoreClosesCleanly(t *testing.T) {
 	r := New(nil, nil, nil).(*resolver)
 	r.Start(reconcileAuth)
-	assert.Nil(t, r.cancel)
 	require.NoError(t, r.Close())
+	select {
+	case <-r.done:
+	default:
+		t.Fatal("Close must wait for the reconciler goroutine to exit")
+	}
 }

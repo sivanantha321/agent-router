@@ -20,12 +20,12 @@ type redisStore struct {
 	client redis.UniversalClient
 }
 
-// NewRedisStore returns a ReconcileStore backed by the Redis instance at url, which accepts
+// NewRedisStore returns a Store backed by the Redis instance at url, which accepts
 // either a bare "host:port" or a full "redis://" URL.
 //
 // No connection is established here; go-redis dials lazily. A Redis that is unreachable
 // therefore surfaces as an error from Get/Set, which resolvers treat as a miss.
-func NewRedisStore(url string) (ReconcileStore, error) {
+func NewRedisStore(url string) (Store, error) {
 	opts, err := parseRedisURL(url)
 	if err != nil {
 		return nil, err
@@ -74,7 +74,7 @@ func (s *redisStore) Set(ctx context.Context, key string, e Entry, ttl time.Dura
 	return nil
 }
 
-// SetNX implements ReconcileStore.
+// SetNX implements Store.
 func (s *redisStore) SetNX(ctx context.Context, key string, e Entry, ttl time.Duration) (bool, error) {
 	wrote, err := s.client.SetNX(ctx, key, encodeEntry(e), ttl).Result()
 	if err != nil {
@@ -83,7 +83,7 @@ func (s *redisStore) SetNX(ctx context.Context, key string, e Entry, ttl time.Du
 	return wrote, nil
 }
 
-// AcquireGate implements ReconcileStore.
+// AcquireGate implements Store.
 func (s *redisStore) AcquireGate(ctx context.Context, key string, ttl time.Duration) (bool, error) {
 	won, err := s.client.SetNX(ctx, key, "1", ttl).Result()
 	if err != nil {
@@ -92,7 +92,7 @@ func (s *redisStore) AcquireGate(ctx context.Context, key string, ttl time.Durat
 	return won, nil
 }
 
-var _ ReconcileStore = (*redisStore)(nil)
+var _ Store = (*redisStore)(nil)
 
 // encodeEntry serializes an entry as "<RFC3339 expiry>|<cache name>". The cache name is
 // last because it is the only field that may itself contain the separator.

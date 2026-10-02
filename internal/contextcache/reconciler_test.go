@@ -33,7 +33,7 @@ func (s *fakeSource) List(_ context.Context, add func(string, Entry)) error {
 	return s.err
 }
 
-func newTestReconciler(t *testing.T, src *fakeSource) (*Reconciler, ReconcileStore) {
+func newTestReconciler(t *testing.T, src *fakeSource) (*Reconciler, Store) {
 	t.Helper()
 	store, _ := newTestRedisStore(t)
 	return &Reconciler{Store: store, Source: src, Interval: time.Minute}, store
@@ -121,4 +121,20 @@ func TestReconciler_RunStopsOnCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run must return when its context is cancelled")
 	}
+}
+
+func TestNoopStore_ReconcilerMethods(t *testing.T) {
+	var s NoopStore
+	wrote, err := s.SetNX(context.Background(), "k", Entry{Name: "n", ExpireTime: time.Now().Add(time.Hour)}, time.Minute)
+	require.NoError(t, err)
+	assert.False(t, wrote)
+	won, err := s.AcquireGate(context.Background(), "g", time.Minute)
+	require.NoError(t, err)
+	assert.False(t, won)
+
+	src := &fakeSource{gate: "g"}
+	stats, err := (&Reconciler{Store: s, Source: src, Interval: time.Minute}).RunOnce(context.Background())
+	require.NoError(t, err)
+	assert.True(t, stats.Gated)
+	assert.Equal(t, 0, src.calls)
 }

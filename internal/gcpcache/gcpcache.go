@@ -115,7 +115,7 @@ const reconcileInterval = 60 * time.Second
 type Background interface {
 	// Start begins background reconciliation for gcpAuth's project and region. It runs
 	// under a context the resolver owns, not the caller's, so it outlives the call. It
-	// does nothing if already started, if closed, or if the store cannot reconcile.
+	// does nothing if already started or if closed.
 	Start(gcpAuth filterapi.GCPAuthHandler)
 	// Close stops background work and waits for it to exit. It is idempotent.
 	io.Closer
@@ -130,10 +130,7 @@ func (r *resolver) Start(gcpAuth filterapi.GCPAuthHandler) {
 	if r.closed || r.cancel != nil {
 		return
 	}
-	rc, ok := r.newReconciler(gcpAuth, reconcileInterval)
-	if !ok {
-		return
-	}
+	rc := r.newReconciler(gcpAuth, reconcileInterval)
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
 	r.done = make(chan struct{})

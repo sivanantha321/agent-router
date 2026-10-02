@@ -103,8 +103,7 @@ type ContextCacheSpec struct {
 	DefaultTTL string `json:"defaultTTL,omitempty"`
 
 	// URL locates the shared Redis store that records which cachedContents entry a given
-	// request prefix resolved to. Sharing that state across gateway replicas is what
-	// prevents two replicas from independently creating a cache for the same prefix.
+	// request prefix resolved to.
 	//
 	// It is given either as a bare "host:port"
 	// (e.g. "redis.default.svc.cluster.local:6379") or as a full "redis://" URL.

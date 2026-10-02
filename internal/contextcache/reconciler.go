@@ -46,9 +46,6 @@ type Stats struct {
 // provider but that the store does not know about, after a store flush or eviction, a
 // dropped write, or a cache created before the store was configured.
 //
-// It never serves requests. If it is late, stuck, or stopped, requests still succeed;
-// the only effect is that more of them create a cache instead of reusing one.
-//
 // Each round:
 //  1. Acquires the source's gate with SET NX and the interval as TTL, so across the fleet
 //     at most one replica lists a scope per interval. A replica that loses skips the round.
@@ -56,7 +53,7 @@ type Stats struct {
 //  3. Writes each entry with SET NX and a TTL pinned to its expiry. SET NX means it only
 //     fills gaps and never overwrites a name that a request just published.
 type Reconciler struct {
-	Store    ReconcileStore
+	Store    Store
 	Source   Source
 	Interval time.Duration
 	Logger   *slog.Logger

@@ -52,19 +52,14 @@ type listResponse struct {
 	NextPageToken  string              `json:"nextPageToken"`
 }
 
-// newReconciler returns a reconciler for gcpAuth's project and region. It reports false
-// when the store cannot back one, such as the no-op store.
-func (r *resolver) newReconciler(gcpAuth filterapi.GCPAuthHandler, interval time.Duration) (*contextcache.Reconciler, bool) {
-	rs, ok := r.store.(contextcache.ReconcileStore)
-	if !ok {
-		return nil, false
-	}
+// newReconciler returns a reconciler for gcpAuth's project and region.
+func (r *resolver) newReconciler(gcpAuth filterapi.GCPAuthHandler, interval time.Duration) *contextcache.Reconciler {
 	return &contextcache.Reconciler{
-		Store:    rs,
+		Store:    r.store,
 		Source:   &listSource{r: r, auth: gcpAuth},
 		Interval: interval,
 		Logger:   r.logger,
-	}, true
+	}
 }
 
 // listSource is a contextcache.Source over cachedContents.list.

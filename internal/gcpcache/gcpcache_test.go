@@ -195,6 +195,21 @@ func (m *memStore) Set(_ context.Context, key string, e contextcache.Entry, _ ti
 	return nil
 }
 
+func (m *memStore) SetNX(_ context.Context, key string, e contextcache.Entry, _ time.Duration) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.entries[key]; ok {
+		return false, nil
+	}
+	m.entries[key] = e
+	return true, nil
+}
+
+// AcquireGate never wins: resolver tests using memStore do not exercise reconciliation.
+func (m *memStore) AcquireGate(context.Context, string, time.Duration) (bool, error) {
+	return false, nil
+}
+
 func (m *memStore) seed(key, cacheName string, expireTime time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -581,6 +596,10 @@ func TestResolver_TTLDefault_SentToGoogle(t *testing.T) {
 	var body gcp.CreateCachedContent
 	require.NoError(t, json.Unmarshal(capturedBody, &body))
 	assert.Equal(t, defaultTTL, body.TTL)
+	// The resolver sets a TTL, not an expiry. A zero-value expiry must not be sent, or
+	// Google would receive "0001-01-01T00:00:00Z" alongside the TTL.
+	assert.Nil(t, body.ExpireTime)
+	assert.NotContains(t, string(capturedBody), "expireTime")
 }
 
 func TestResolver_TTLOverride_SentToGoogle(t *testing.T) {

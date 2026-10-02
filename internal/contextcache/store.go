@@ -28,7 +28,7 @@ type Entry struct {
 // Store maps a deterministic cache key to the provider cache it resolved to.
 //
 // The store is shared across gateway replicas, so a cache name published by one
-// replica is reused by all of them. It is a cache, not a lock: replicas that miss the
+// replica is reused by all of them. Replicas that miss the
 // same cold prefix at the same moment may each create a provider cache, and resolvers
 // tolerate that. Implementations must be safe for concurrent use.
 //
@@ -40,13 +40,6 @@ type Store interface {
 	Get(ctx context.Context, key string) (Entry, bool, error)
 	// Set records e under key, expiring it after ttl.
 	Set(ctx context.Context, key string, e Entry, ttl time.Duration) error
-}
-
-// ReconcileStore is implemented by stores that can back a Reconciler. It is kept out of
-// Store so that the no-op store and test stores need not implement it; a store that does
-// not implement it simply has no reconciler.
-type ReconcileStore interface {
-	Store
 	// SetNX records e under key only if key is absent. It reports whether it wrote.
 	SetNX(ctx context.Context, key string, e Entry, ttl time.Duration) (bool, error)
 	// AcquireGate claims key for ttl. It reports whether the caller won.
@@ -59,6 +52,9 @@ type ReconcileStore interface {
 //
 // This is what makes "store unconfigured" behave identically to "store unreachable"
 // without a nil check at each call site.
+//
+// AcquireGate never wins, so a Reconciler over a NoopStore reports every round as gated
+// and never lists the provider.
 type NoopStore struct{}
 
 // Get implements Store.
@@ -66,5 +62,15 @@ func (NoopStore) Get(context.Context, string) (Entry, bool, error) { return Entr
 
 // Set implements Store.
 func (NoopStore) Set(context.Context, string, Entry, time.Duration) error { return nil }
+
+// SetNX implements Store.
+func (NoopStore) SetNX(context.Context, string, Entry, time.Duration) (bool, error) {
+	return false, nil
+}
+
+// AcquireGate implements Store.
+func (NoopStore) AcquireGate(context.Context, string, time.Duration) (bool, error) {
+	return false, nil
+}
 
 var _ Store = NoopStore{}
