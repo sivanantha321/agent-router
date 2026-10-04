@@ -3,7 +3,7 @@
 // The full text of the Apache license is available in the LICENSE file at
 // the root of the repo.
 
-package contextcache
+package redis
 
 import (
 	"context"
@@ -13,13 +13,15 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/envoyproxy/ai-gateway/internal/contextcache"
 )
 
 // newTestRedisStore starts an in-process Redis and returns a store pointed at it.
 func newTestRedisStore(t *testing.T) (*redisStore, *miniredis.Miniredis) {
 	t.Helper()
 	mr := miniredis.RunT(t)
-	s, err := NewRedisStore(mr.Addr())
+	s, err := NewStore(mr.Addr())
 	require.NoError(t, err)
 	return s.(*redisStore), mr
 }
@@ -51,7 +53,7 @@ func TestRedisStore_SetGetRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	expire := time.Now().Add(10 * time.Minute).UTC().Truncate(time.Second)
 
-	require.NoError(t, s.Set(ctx, "k", Entry{Name: "projects/p/locations/r/cachedContents/x", ExpireTime: expire}, time.Minute))
+	require.NoError(t, s.Set(ctx, "k", contextcache.Entry{Name: "projects/p/locations/r/cachedContents/x", ExpireTime: expire}, time.Minute))
 
 	got, ok, err := s.Get(ctx, "k")
 	require.NoError(t, err)
@@ -81,7 +83,7 @@ func TestRedisStore_MalformedValueIsAMiss(t *testing.T) {
 func TestEncodeDecodeEntry(t *testing.T) {
 	expire := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
 	// The cache name is encoded last precisely because it may contain the separator.
-	e := Entry{Name: "projects/p|weird/cachedContents/x", ExpireTime: expire}
+	e := contextcache.Entry{Name: "projects/p|weird/cachedContents/x", ExpireTime: expire}
 
 	got, err := decodeEntry(encodeEntry(e))
 	require.NoError(t, err)

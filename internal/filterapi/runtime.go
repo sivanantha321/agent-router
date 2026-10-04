@@ -12,6 +12,7 @@ import (
 	"github.com/google/cel-go/cel"
 	"golang.org/x/oauth2"
 
+	"github.com/envoyproxy/ai-gateway/internal/contextcache"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 	"github.com/envoyproxy/ai-gateway/internal/llmcostcel"
 )
@@ -68,11 +69,9 @@ type RuntimeBackend struct {
 	Backend *Backend
 	// Handler is the backend auth handler.
 	Handler BackendAuthHandler
-	// CacheResolver is the in-process context-cache resolver for this backend.
-	// It is populated by the extproc layer for GCP Vertex AI backends (where Handler
-	// implements GCPAuthHandler). Held as any to avoid an import cycle between
-	// filterapi and gcpcache; callers type-assert to gcpcache.CacheResolver.
-	CacheResolver any
+	// CacheResolver is the in-process context-cache resolver for this backend. Currently
+	// only used for GCP Vertex AI backends with context caching configured.
+	CacheResolver contextcache.CacheResolver
 }
 
 // RuntimeGlobalRequestCost is the configuration for gateway-level default request costs.

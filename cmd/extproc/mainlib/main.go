@@ -425,7 +425,7 @@ func Main(ctx context.Context, args []string, stderr io.Writer) (err error) {
 	go func() {
 		<-ctx.Done()
 		s.GracefulStop()
-		// Stop context-cache reconcilers once no request can reach a resolver.
+		// Stop context-cache syncers once no request can reach a resolver.
 		server.Close()
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -137,6 +137,23 @@ func TestServer_LoadConfig_GCPCacheResolver_ReusedAcrossReloads(t *testing.T) {
 		"an unchanged backend must keep its resolver, and with it its connection pool")
 }
 
+// A reused resolver must pick up the handler rebuilt on reload, since the controller
+// rotates the access token without changing the Redis URL.
+func TestServer_LoadConfig_GCPCacheResolver_ReusedResolverGetsNewHandler(t *testing.T) {
+	s := &Server{}
+	t.Cleanup(s.Close)
+	config := &filterapi.Config{Backends: []filterapi.Backend{gcpBackendWithCaching("gcp", "localhost:6379")}}
+
+	require.NoError(t, s.LoadConfig(t.Context(), config))
+	first := s.config.Backends["gcp"].Handler
+
+	require.NoError(t, s.LoadConfig(t.Context(), config))
+	second := s.config.Backends["gcp"].Handler
+	require.NotSame(t, first, second, "the handler is rebuilt on every reload")
+	require.Equal(t, second, s.cacheResolvers["gcp|localhost:6379"].GetAuth(),
+		"the reused resolver must hold the current handler")
+}
+
 // Repointing a backend at a different Redis must not keep reusing a pool dialing the old one.
 func TestServer_LoadConfig_GCPCacheResolver_RebuiltWhenRedisURLChanges(t *testing.T) {
 	s := &Server{}
@@ -187,7 +204,7 @@ func TestServer_LoadConfig_GCPCacheResolver_BadRedisURLDoesNotFailReload(t *test
 		"an unrelated backend must keep its resolver")
 }
 
-// A resolver evicted by a reload must have its background reconciler stopped, or every
+// A resolver evicted by a reload must have its background syncer stopped, or every
 // reload that drops or repoints a backend would leak a goroutine.
 func TestServer_LoadConfig_GCPCacheResolver_EvictedResolverIsClosed(t *testing.T) {
 	before := goleak.IgnoreCurrent()
@@ -197,20 +214,20 @@ func TestServer_LoadConfig_GCPCacheResolver_EvictedResolverIsClosed(t *testing.T
 		gcpBackendWithCaching("gcp-a", "localhost:6379"),
 		gcpBackendWithCaching("gcp-b", "localhost:6379"),
 	}}))
-	kept := s.cacheResolvers["gcp-a|localhost:6379"].(io.Closer)
+	kept := s.cacheResolvers["gcp-a|localhost:6379"]
 
 	require.NoError(t, s.LoadConfig(t.Context(), &filterapi.Config{Backends: []filterapi.Backend{
 		gcpBackendWithCaching("gcp-a", "localhost:6379"),
 	}}))
 	// Closing the one resolver still in the config must leave nothing running. If the
-	// evicted resolver had not been closed by the reload, its reconciler would remain.
+	// evicted resolver had not been closed by the reload, its syncer would remain.
 	require.NoError(t, kept.Close())
 	goleak.VerifyNone(t, before)
 }
 
-// The reload context is cancelled when the reload finishes. Reconcilers must not be tied
+// The reload context is cancelled when the reload finishes. Syncers must not be tied
 // to it, or they would stop seconds after every config load.
-func TestServer_LoadConfig_ReconcilerOutlivesReloadContext(t *testing.T) {
+func TestServer_LoadConfig_SyncerOutlivesReloadContext(t *testing.T) {
 	before := goleak.IgnoreCurrent()
 	s := &Server{}
 
@@ -220,7 +237,7 @@ func TestServer_LoadConfig_ReconcilerOutlivesReloadContext(t *testing.T) {
 	}}))
 	cancel()
 	time.Sleep(50 * time.Millisecond)
-	require.Error(t, goleak.Find(before), "the reconciler must still be running after the reload context ends")
+	require.Error(t, goleak.Find(before), "the syncer must still be running after the reload context ends")
 
 	s.Close()
 	goleak.VerifyNone(t, before)

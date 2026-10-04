@@ -208,7 +208,7 @@ type Backend struct {
 	// the request to the backend. Optional.
 	HeaderValueFilters []HTTPHeaderValueFilter `json:"headerValueFilters,omitempty"`
 	// ContextCache configures context caching for this backend. Optional.
-	// When non-nil, the extproc will resolve or create a Google cachedContents entry
+	// When non-nil, the extproc will resolve or create a GCP cachedContents entry
 	// for requests that carry cache_control markers.
 	ContextCache *ContextCache `json:"contextCache,omitempty"`
 }
@@ -219,12 +219,12 @@ type Backend struct {
 // cache entry is created when absent.
 type ContextCache struct {
 	// DefaultTTL is the default time-to-live for newly created cache entries expressed
-	// as a GCP duration string (e.g. "600s"). When empty, the resolver default (300s) is used.
+	// as a duration string (e.g. "600s"). When empty, the resolver default (300s) is used.
 	// +optional
 	DefaultTTL string `json:"defaultTTL,omitempty"`
 	// URL points at the shared Redis store that records which cachedContents entry a
-	// given prefix resolved to. It is what stops two gateway replicas from
-	// independently creating a cache for the same prefix.
+	// given prefix resolved to. Once one replica has created a cache, the others reuse
+	// it. Replicas that miss the same prefix at the same moment may each create one.
 	//
 	// It is either a bare "host:port" or a full "redis://" URL.
 	URL string `json:"url"`

@@ -20,25 +20,25 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/envoyproxy/ai-gateway/internal/contextcache"
+	"github.com/envoyproxy/ai-gateway/internal/contextcache/redis"
 )
 
-var reconcileAuth = &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
+var syncAuth = &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
 
 // newTestRedisStore starts an in-process Redis and returns a store pointed at it.
-func newTestRedisStore(t *testing.T) (contextcache.ReconcileStore, *miniredis.Miniredis) {
+func newTestRedisStore(t *testing.T) (contextcache.Store, *miniredis.Miniredis) {
 	t.Helper()
 	mr := miniredis.RunT(t)
-	s, err := contextcache.NewRedisStore(mr.Addr())
+	s, err := redis.NewStore(mr.Addr())
 	require.NoError(t, err)
 	return s, mr
 }
 
-// reconcileOnce runs one round for auth against r's store and returns its stats and the
+// syncOnce runs one round for auth against r's store and returns its stats and the
 // number of list pages read.
-func reconcileOnce(t *testing.T, r *resolver, auth *fakeGCPAuth) (contextcache.Stats, int, error) {
+func syncOnce(t *testing.T, r *Resolver, auth *fakeGCPAuth) (contextcache.Stats, int, error) {
 	t.Helper()
-	rc, ok := r.newReconciler(auth, time.Minute)
-	require.True(t, ok)
+	rc := r.newSyncer(auth, time.Minute)
 	stats, err := rc.RunOnce(context.Background())
 	return stats, rc.Source.(*listSource).pages, err
 }
@@ -57,7 +57,7 @@ func newListServer(t *testing.T, pages map[string]string) (*httptest.Server, *at
 	var queries []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			t.Errorf("reconciler issued %s; it must only list", r.Method)
+			t.Errorf("syncer issued %s; it must only list", r.Method)
 		}
 		calls.Add(1)
 		queries = append(queries, r.URL.RawQuery)
@@ -73,7 +73,7 @@ func newListServer(t *testing.T, pages map[string]string) (*httptest.Server, *at
 	return srv, &calls, &queries
 }
 
-func TestReconcile_MultiPageWalkWritesEveryEntry(t *testing.T) {
+func TestSync_MultiPageWalkWritesEveryEntry(t *testing.T) {
 	exp := time.Now().Add(5 * time.Minute)
 	srv, calls, queries := newListServer(t, map[string]string{
 		"":   `{"cachedContents":[` + itemJSON(testKey(1), "c/1", exp) + `],"nextPageToken":"p2"}`,
@@ -82,7 +82,7 @@ func TestReconcile_MultiPageWalkWritesEveryEntry(t *testing.T) {
 	store, _ := newTestRedisStore(t)
 	r := resolverWithServer(srv.URL, store)
 
-	stats, pages, err := reconcileOnce(t, r, reconcileAuth)
+	stats, pages, err := syncOnce(t, r, syncAuth)
 	require.NoError(t, err)
 	assert.Equal(t, 2, pages)
 	assert.Equal(t, 2, stats.Written)
@@ -98,7 +98,7 @@ func TestReconcile_MultiPageWalkWritesEveryEntry(t *testing.T) {
 	}
 }
 
-func TestReconcile_DoesNotOverwriteExistingEntry(t *testing.T) {
+func TestSync_DoesNotOverwriteExistingEntry(t *testing.T) {
 	exp := time.Now().Add(5 * time.Minute)
 	srv, _, _ := newListServer(t, map[string]string{
 		"": `{"cachedContents":[` + itemJSON(testKey(1), "c/from-list", exp) + `]}`,
@@ -107,80 +107,51 @@ func TestReconcile_DoesNotOverwriteExistingEntry(t *testing.T) {
 	require.NoError(t, store.Set(context.Background(), testKey(1), contextcache.Entry{Name: "c/published", ExpireTime: exp}, time.Minute))
 	r := resolverWithServer(srv.URL, store)
 
-	stats, _, err := reconcileOnce(t, r, reconcileAuth)
+	stats, _, err := syncOnce(t, r, syncAuth)
 	require.NoError(t, err)
 	assert.Equal(t, 0, stats.Written)
 	e, _, _ := store.Get(context.Background(), testKey(1))
-	assert.Equal(t, "c/published", e.Name, "reconciler must not clobber a request's write")
+	assert.Equal(t, "c/published", e.Name, "syncer must not clobber a request's write")
 }
 
-func TestReconcile_PageLimitStopsEndlessChain(t *testing.T) {
-	var calls atomic.Int64
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		n := calls.Add(1)
-		_, _ = fmt.Fprintf(w, `{"cachedContents":[],"nextPageToken":"t%d"}`, n)
-	}))
-	t.Cleanup(srv.Close)
-	store, _ := newTestRedisStore(t)
-	r := resolverWithServer(srv.URL, store)
-
-	_, pages, err := reconcileOnce(t, r, reconcileAuth)
-	require.NoError(t, err)
-	assert.Equal(t, listMaxPages, pages)
-	assert.Equal(t, int64(listMaxPages), calls.Load())
-}
-
-func TestReconcile_RepeatedTokenEndsWalk(t *testing.T) {
-	srv, calls, _ := newListServer(t, map[string]string{
-		"":     `{"cachedContents":[],"nextPageToken":"same"}`,
-		"same": `{"cachedContents":[],"nextPageToken":"same"}`,
-	})
-	store, _ := newTestRedisStore(t)
-	r := resolverWithServer(srv.URL, store)
-
-	_, _, err := reconcileOnce(t, r, reconcileAuth)
-	require.NoError(t, err)
-	assert.Equal(t, int64(2), calls.Load())
-}
-
-func TestReconcile_GateSkipsSecondReplica(t *testing.T) {
+func TestSync_GateSkipsSecondReplica(t *testing.T) {
 	srv, calls, _ := newListServer(t, map[string]string{"": `{"cachedContents":[]}`})
 	store, mr := newTestRedisStore(t)
-	second, err := contextcache.NewRedisStore(mr.Addr())
+	second, err := redis.NewStore(mr.Addr())
 	require.NoError(t, err)
 	a := resolverWithServer(srv.URL, store)
 	b := resolverWithServer(srv.URL, second)
 
-	statsA, _, err := reconcileOnce(t, a, reconcileAuth)
+	statsA, _, err := syncOnce(t, a, syncAuth)
 	require.NoError(t, err)
 	assert.False(t, statsA.Gated)
-	statsB, _, err := reconcileOnce(t, b, reconcileAuth)
+	statsB, _, err := syncOnce(t, b, syncAuth)
 	require.NoError(t, err)
 	assert.True(t, statsB.Gated)
 	assert.Equal(t, int64(1), calls.Load())
 
-	// Once the interval passes, a replica may reconcile again.
+	// Once the interval passes, a replica may sync again.
 	mr.FastForward(time.Minute + time.Second)
-	statsB, _, err = reconcileOnce(t, b, reconcileAuth)
+	statsB, _, err = syncOnce(t, b, syncAuth)
 	require.NoError(t, err)
 	assert.False(t, statsB.Gated)
 }
 
-func TestReconcile_GateIsPerProjectRegion(t *testing.T) {
+func TestSync_GateIsPerProjectRegion(t *testing.T) {
 	srv, calls, _ := newListServer(t, map[string]string{"": `{"cachedContents":[]}`})
 	store, _ := newTestRedisStore(t)
 	r := resolverWithServer(srv.URL, store)
 	other := &fakeGCPAuth{token: "tok", region: "europe-west1", project: "p"}
 
-	_, _, err := reconcileOnce(t, r, reconcileAuth)
+	_, _, err := syncOnce(t, r, syncAuth)
 	require.NoError(t, err)
-	stats, _, err := reconcileOnce(t, r, other)
+	stats, _, err := syncOnce(t, r, other)
 	require.NoError(t, err)
 	assert.False(t, stats.Gated, "one region's round must not suppress another's")
 	assert.Equal(t, int64(2), calls.Load())
 }
 
-func TestReconcile_SkipsForeignExpiredAndUnparseable(t *testing.T) {
+func TestSync_SkipsForeignExpiredAndUnparseable(t *testing.T) {
 	exp := time.Now().Add(5 * time.Minute)
 	items := []string{
 		itemJSON("my-own-cache", "c/foreign", exp),                         // not a cache key
@@ -192,7 +163,7 @@ func TestReconcile_SkipsForeignExpiredAndUnparseable(t *testing.T) {
 	store, mr := newTestRedisStore(t)
 	r := resolverWithServer(srv.URL, store)
 
-	stats, _, err := reconcileOnce(t, r, reconcileAuth)
+	stats, _, err := syncOnce(t, r, syncAuth)
 	require.NoError(t, err)
 	// Foreign and unparseable items are dropped by the source; the near-expiry one is
 	// seen but not written.
@@ -205,18 +176,18 @@ func TestReconcile_SkipsForeignExpiredAndUnparseable(t *testing.T) {
 	assert.True(t, mr.Exists(testKey(3)))
 }
 
-func TestReconcile_EntryTTLMatchesExpiry(t *testing.T) {
+func TestSync_EntryTTLMatchesExpiry(t *testing.T) {
 	exp := time.Now().Add(5 * time.Minute)
 	srv, _, _ := newListServer(t, map[string]string{"": `{"cachedContents":[` + itemJSON(testKey(1), "c/1", exp) + `]}`})
 	store, mr := newTestRedisStore(t)
 	r := resolverWithServer(srv.URL, store)
 
-	_, _, err := reconcileOnce(t, r, reconcileAuth)
+	_, _, err := syncOnce(t, r, syncAuth)
 	require.NoError(t, err)
 	assert.InDelta(t, (5 * time.Minute).Seconds(), mr.TTL(testKey(1)).Seconds(), 5)
 }
 
-func TestReconcile_ListFailureReturnsError(t *testing.T) {
+func TestSync_ListFailureReturnsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -224,14 +195,19 @@ func TestReconcile_ListFailureReturnsError(t *testing.T) {
 	store, _ := newTestRedisStore(t)
 	r := resolverWithServer(srv.URL, store)
 
-	_, _, err := reconcileOnce(t, r, reconcileAuth)
+	_, _, err := syncOnce(t, r, syncAuth)
 	require.ErrorContains(t, err, "HTTP 500")
 }
 
-func TestNewReconciler_NoopStoreHasNone(t *testing.T) {
-	r := New(nil, nil, nil).(*resolver)
-	_, ok := r.newReconciler(reconcileAuth, time.Minute)
-	assert.False(t, ok, "a store that cannot reconcile must not get a reconciler")
+// A no-op store never wins the gate, so its rounds never list the provider.
+func TestSync_NoopStoreIsGatedAndNeverLists(t *testing.T) {
+	srv, calls, _ := newListServer(t, map[string]string{"": `{"cachedContents":[]}`})
+	r := resolverWithServer(srv.URL)
+
+	stats, _, err := syncOnce(t, r, syncAuth)
+	require.NoError(t, err)
+	assert.True(t, stats.Gated)
+	assert.Equal(t, int64(0), calls.Load())
 }
 
 func TestIsCacheKey(t *testing.T) {
@@ -245,7 +221,7 @@ func TestIsCacheKey(t *testing.T) {
 // Lifecycle
 // -----------------------------------------------------------------------
 
-func TestResolver_StartRunsReconcilerAndCloseStopsIt(t *testing.T) {
+func TestResolver_StartRunsSyncerAndCloseStopsIt(t *testing.T) {
 	exp := time.Now().Add(5 * time.Minute)
 	srv, calls, _ := newListServer(t, map[string]string{
 		"": `{"cachedContents":[` + itemJSON(testKey(1), "c/1", exp) + `]}`,
@@ -253,15 +229,15 @@ func TestResolver_StartRunsReconcilerAndCloseStopsIt(t *testing.T) {
 	store, mr := newTestRedisStore(t)
 	r := resolverWithServer(srv.URL, store)
 
-	r.Start(reconcileAuth)
+	r.Start()
 	require.Eventually(t, func() bool { return mr.Exists(testKey(1)) }, 2*time.Second, 10*time.Millisecond,
-		"Start must run a reconcile round")
+		"Start must run a sync round")
 
 	require.NoError(t, r.Close())
 	select {
 	case <-r.done:
 	default:
-		t.Fatal("Close must wait for the reconciler goroutine to exit")
+		t.Fatal("Close must wait for the syncer goroutine to exit")
 	}
 	assert.Equal(t, int64(1), calls.Load())
 }
@@ -271,10 +247,10 @@ func TestResolver_StartIsIdempotent(t *testing.T) {
 	store, _ := newTestRedisStore(t)
 	r := resolverWithServer(srv.URL, store)
 
-	r.Start(reconcileAuth)
+	r.Start()
 	first := r.done
-	r.Start(reconcileAuth)
-	assert.Equal(t, first, r.done, "a second Start must not launch another reconciler")
+	r.Start()
+	assert.Equal(t, first, r.done, "a second Start must not launch another syncer")
 	require.NoError(t, r.Close())
 }
 
@@ -285,14 +261,51 @@ func TestResolver_CloseIsIdempotentAndBlocksLaterStart(t *testing.T) {
 
 	require.NoError(t, r.Close(), "Close before Start must be safe")
 	require.NoError(t, r.Close())
-	r.Start(reconcileAuth)
+	r.Start()
 	assert.Nil(t, r.cancel, "Start after Close must do nothing")
 	assert.Equal(t, int64(0), calls.Load())
 }
 
-func TestResolver_StartWithNoopStoreDoesNothing(t *testing.T) {
-	r := New(nil, nil, nil).(*resolver)
-	r.Start(reconcileAuth)
-	assert.Nil(t, r.cancel)
+func TestResolver_StartWithNoopStoreClosesCleanly(t *testing.T) {
+	r := New(nil, nil, syncAuth, nil)
+	r.Start()
 	require.NoError(t, r.Close())
+	select {
+	case <-r.done:
+	default:
+		t.Fatal("Close must wait for the syncer goroutine to exit")
+	}
+}
+
+// The syncer reads the resolver's current credentials each round, so SetAuth after a
+// config reload moves the next round to the new project and region.
+func TestSync_FollowsSetAuth(t *testing.T) {
+	srv, _, queries := newListServer(t, map[string]string{"": `{"cachedContents":[]}`})
+	store, _ := newTestRedisStore(t)
+	r := resolverWithServer(srv.URL, store)
+	rc := r.newSyncer(nil, time.Minute)
+
+	assert.Equal(t, syncGatePrefix+"p/us-central1", rc.Source.GateKey())
+	r.SetAuth(&fakeGCPAuth{token: "tok2", region: "europe-west1", project: "q"})
+	assert.Equal(t, syncGatePrefix+"q/europe-west1", rc.Source.GateKey())
+
+	_, err := rc.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.Len(t, *queries, 1)
+}
+
+// Resolve uses the credentials set most recently, so a rotated token reaches GCP.
+func TestResolver_SetAuthRotatesToken(t *testing.T) {
+	var gotAuth atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth.Store(r.Header.Get("Authorization"))
+		_, _ = fmt.Fprintf(w, `{"name":"c/x","expireTime":%q}`, time.Now().Add(5*time.Minute).UTC().Format(time.RFC3339))
+	}))
+	t.Cleanup(srv.Close)
+	r := resolverWithServer(srv.URL)
+	r.SetAuth(&fakeGCPAuth{token: "rotated", region: "us-central1", project: "p"})
+
+	_, err := r.Resolve(context.Background(), crossReplicaRequest())
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer rotated", gotAuth.Load())
 }

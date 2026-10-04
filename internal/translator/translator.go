@@ -117,26 +117,27 @@ type ResponseRedactor interface {
 	RedactBody(resp *openai.ChatCompletionResponse) *openai.ChatCompletionResponse
 }
 
-// GCPCacheSetter is an optional interface implemented by the GCP Vertex AI translator.
-// The upstream processor calls SetGCPCacheResult after the context-cache resolver runs so
-// that the translator can (a) inject the cache resource name into the Gemini request and
-// (b) record cache-write token counts for cost attribution in the response phase.
-type GCPCacheSetter interface {
-	// SetGCPCacheResult forwards the resolved (or newly created) cache entry to the translator.
+// ContextCacheSetter is an optional interface implemented by translators whose provider
+// supports context caching (currently GCP Vertex AI Gemini). The upstream processor calls
+// SetContextCacheResult after the context-cache resolver runs so that the translator can
+// (a) reference the provider cache in the upstream request and (b) record cache-write
+// token counts for cost attribution in the response phase.
+type ContextCacheSetter interface {
+	// SetContextCacheResult forwards the resolved (or newly created) cache entry to the translator.
 	// Must be called before RequestBody.
-	SetGCPCacheResult(result *GCPCacheResult)
+	SetContextCacheResult(result *ContextCacheResult)
 }
 
-// GCPCacheResult carries the information returned by the cache resolver that the translator needs.
-type GCPCacheResult struct {
-	// CacheName is the full Google resource name of the resolved or created cache entry.
+// ContextCacheResult carries the information returned by the cache resolver that the translator needs.
+type ContextCacheResult struct {
+	// CacheName is the provider's name for the resolved or created cache entry.
 	CacheName string
 	// FilteredMessages is the non-cached remainder of the conversation (messages after the breakpoint).
-	// The translator replaces the original messages with this slice when building the Gemini request.
+	// The translator replaces the original messages with this slice when building the provider request.
 	FilteredMessages []openai.ChatCompletionMessageParamUnion
 	// Created is true when this call created a new cache entry (cache-write cost applies).
 	Created bool
-	// WriteTokenCount is the number of tokens stored in the cache (from Google's create response).
+	// WriteTokenCount is the number of tokens stored in the cache, from the provider's create response.
 	// Only meaningful when Created is true.
 	WriteTokenCount uint32
 }

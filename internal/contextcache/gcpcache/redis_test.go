@@ -21,6 +21,7 @@ import (
 
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
 	"github.com/envoyproxy/ai-gateway/internal/contextcache"
+	"github.com/envoyproxy/ai-gateway/internal/contextcache/redis"
 )
 
 // -----------------------------------------------------------------------
@@ -35,21 +36,20 @@ func TestResolver_CrossReplica_SecondResolveHitsStore(t *testing.T) {
 	fake := newFakeCacheServer(t, `{"cachedContents":[]}`, createResp, http.StatusOK)
 
 	mr := miniredis.RunT(t)
-	newReplica := func() *resolver {
-		store, err := contextcache.NewRedisStore(mr.Addr())
+	newReplica := func() *Resolver {
+		store, err := redis.NewStore(mr.Addr())
 		require.NoError(t, err)
 		return resolverWithServer(fake.srv.URL, store)
 	}
 	a, b := newReplica(), newReplica()
-	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
 
-	resA, err := a.Resolve(context.Background(), crossReplicaRequest(), auth)
+	resA, err := a.Resolve(context.Background(), crossReplicaRequest())
 	require.NoError(t, err)
 	require.NotNil(t, resA)
 	assert.True(t, resA.Created)
 	assert.Equal(t, 512, resA.TokenCount)
 
-	resB, err := b.Resolve(context.Background(), crossReplicaRequest(), auth)
+	resB, err := b.Resolve(context.Background(), crossReplicaRequest())
 	require.NoError(t, err)
 	require.NotNil(t, resB)
 	assert.Equal(t, resA.CacheName, resB.CacheName)
@@ -87,19 +87,18 @@ func TestResolver_CrossReplica_ColdPrefixRaceMayDuplicate(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	mr := miniredis.RunT(t)
-	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
 
 	var done sync.WaitGroup
-	results := make([]*ResolveResult, replicas)
+	results := make([]*contextcache.ResolveResult, replicas)
 	errs := make([]error, replicas)
 	for i := range replicas {
-		store, err := contextcache.NewRedisStore(mr.Addr())
+		store, err := redis.NewStore(mr.Addr())
 		require.NoError(t, err)
 		r := resolverWithServer(srv.URL, store)
 		done.Add(1)
 		go func() {
 			defer done.Done()
-			results[i], errs[i] = r.Resolve(context.Background(), crossReplicaRequest(), auth)
+			results[i], errs[i] = r.Resolve(context.Background(), crossReplicaRequest())
 		}()
 	}
 	for range replicas {
@@ -138,7 +137,7 @@ func TestResolver_StoreUnreachable_FailsOpen(t *testing.T) {
 	fake := newFakeCacheServer(t, `{"cachedContents":[]}`, createResp, http.StatusOK)
 
 	mr := miniredis.RunT(t)
-	store, err := contextcache.NewRedisStore(mr.Addr())
+	store, err := redis.NewStore(mr.Addr())
 	require.NoError(t, err)
 	mr.Close() // Every operation now fails to dial.
 
@@ -150,9 +149,8 @@ func TestResolver_StoreUnreachable_FailsOpen(t *testing.T) {
 			userMsg("Hello"),
 		},
 	}
-	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
 
-	res, err := r.Resolve(context.Background(), req, auth)
+	res, err := r.Resolve(context.Background(), req)
 	require.NoError(t, err, "a dead store must not fail the request")
 	require.NotNil(t, res)
 	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/new", res.CacheName)

@@ -147,7 +147,7 @@ func (t *redirectTransport) RoundTrip(req *http.Request) (*http.Response, error)
 
 // resolverWithServer builds a resolver pointed at a fake Google server. An optional store
 // may be supplied; with none, the no-op store applies and every lookup misses.
-func resolverWithServer(srvURL string, store ...contextcache.Store) *resolver {
+func resolverWithServer(srvURL string, store ...contextcache.Store) *Resolver {
 	host := srvURL[len("http://"):]
 	var s contextcache.Store
 	if len(store) > 0 {
@@ -156,7 +156,7 @@ func resolverWithServer(srvURL string, store ...contextcache.Store) *resolver {
 	return New(&http.Client{
 		Transport: &redirectTransport{fakeHost: host},
 		Timeout:   5 * time.Second,
-	}, s, nil).(*resolver)
+	}, s, syncAuth, nil)
 }
 
 // memStore is an in-process contextcache.Store for tests.
@@ -195,6 +195,21 @@ func (m *memStore) Set(_ context.Context, key string, e contextcache.Entry, _ ti
 	return nil
 }
 
+func (m *memStore) SetNX(_ context.Context, key string, e contextcache.Entry, _ time.Duration) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.entries[key]; ok {
+		return false, nil
+	}
+	m.entries[key] = e
+	return true, nil
+}
+
+// AcquireGate never wins: resolver tests using memStore do not exercise syncing.
+func (m *memStore) AcquireGate(context.Context, string, time.Duration) (bool, error) {
+	return false, nil
+}
+
 func (m *memStore) seed(key, cacheName string, expireTime time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -208,7 +223,7 @@ func computeKeyForRequest(t *testing.T, req *openai.ChatCompletionRequest) strin
 	require.GreaterOrEqual(t, bp, 0)
 	contents, sys, err := computeKeyInputs(req.Model, req.Messages[:bp+1])
 	require.NoError(t, err)
-	key, err := computeCacheKey(req.Model, contents, sys, nil)
+	key, err := computeCacheKey(syncAuth.project, syncAuth.region, req.Model, contents, sys, nil)
 	require.NoError(t, err)
 	return key
 }
@@ -327,9 +342,9 @@ func TestComputeCacheKey_Deterministic(t *testing.T) {
 	contents, sys, err := computeKeyInputs("gemini-1.5-pro", msgs)
 	require.NoError(t, err)
 
-	k1, err := computeCacheKey("gemini-1.5-pro", contents, sys, nil)
+	k1, err := computeCacheKey("p", "r", "gemini-1.5-pro", contents, sys, nil)
 	require.NoError(t, err)
-	k2, err := computeCacheKey("gemini-1.5-pro", contents, sys, nil)
+	k2, err := computeCacheKey("p", "r", "gemini-1.5-pro", contents, sys, nil)
 	require.NoError(t, err)
 	assert.Equal(t, k1, k2)
 	assert.Len(t, k1, 64, "expected SHA-256 hex digest")
@@ -339,9 +354,22 @@ func TestComputeCacheKey_DifferentModels_DifferentKeys(t *testing.T) {
 	msgs := []openai.ChatCompletionMessageParamUnion{systemMsg("sys", ephemeralFields())}
 	c, s, err := computeKeyInputs("gemini-1.5-pro", msgs)
 	require.NoError(t, err)
-	k1, _ := computeCacheKey("gemini-1.5-pro", c, s, nil)
-	k2, _ := computeCacheKey("gemini-2.0-flash", c, s, nil)
+	k1, _ := computeCacheKey("p", "r", "gemini-1.5-pro", c, s, nil)
+	k2, _ := computeCacheKey("p", "r", "gemini-2.0-flash", c, s, nil)
 	assert.NotEqual(t, k1, k2)
+}
+
+// A cache name is only usable in its own project and region, so the same prompt must
+// key differently per location when backends share a Redis.
+func TestComputeCacheKey_DifferentLocations_DifferentKeys(t *testing.T) {
+	msgs := []openai.ChatCompletionMessageParamUnion{systemMsg("sys", ephemeralFields())}
+	c, s, err := computeKeyInputs("gemini-1.5-pro", msgs)
+	require.NoError(t, err)
+	base, _ := computeCacheKey("p", "us-central1", "gemini-1.5-pro", c, s, nil)
+	otherRegion, _ := computeCacheKey("p", "europe-west1", "gemini-1.5-pro", c, s, nil)
+	otherProject, _ := computeCacheKey("q", "us-central1", "gemini-1.5-pro", c, s, nil)
+	assert.NotEqual(t, base, otherRegion)
+	assert.NotEqual(t, base, otherProject)
 }
 
 // -----------------------------------------------------------------------
@@ -349,15 +377,35 @@ func TestComputeCacheKey_DifferentModels_DifferentKeys(t *testing.T) {
 // -----------------------------------------------------------------------
 
 func TestResolver_NoMarkers_ReturnsNil(t *testing.T) {
-	r := New(nil, nil, nil).(*resolver)
+	// Credentials must be set, or Resolve returns nil before it looks at the markers.
+	fake := newFakeCacheServer(t, `{"cachedContents":[]}`, "", http.StatusOK)
+	r := resolverWithServer(fake.srv.URL)
 	req := &openai.ChatCompletionRequest{
 		Model:    "gemini-1.5-pro",
 		Messages: []openai.ChatCompletionMessageParamUnion{userMsg("hello")},
 	}
-	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
-	res, err := r.Resolve(context.Background(), req, auth)
+	res, err := r.Resolve(context.Background(), req)
 	require.NoError(t, err)
 	assert.Nil(t, res, "no cache_control markers should return nil")
+	assert.Equal(t, 0, fake.creates())
+}
+
+// A resolver built without credentials is inert: even a marked request is not cached.
+func TestResolver_NilAuth_IsInert(t *testing.T) {
+	fake := newFakeCacheServer(t, `{"cachedContents":[]}`, "", http.StatusOK)
+	r := resolverWithServer(fake.srv.URL)
+	r.SetAuth(nil)
+	req := &openai.ChatCompletionRequest{
+		Model: "gemini-1.5-pro",
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			systemMsg("sys", ephemeralFields()),
+			userMsg("q"),
+		},
+	}
+	res, err := r.Resolve(context.Background(), req)
+	require.NoError(t, err)
+	assert.Nil(t, res)
+	assert.Equal(t, 0, fake.creates())
 }
 
 func TestResolver_CacheMiss_Creates(t *testing.T) {
@@ -366,7 +414,6 @@ func TestResolver_CacheMiss_Creates(t *testing.T) {
 	fake := newFakeCacheServer(t, `{"cachedContents":[]}`, createResp, http.StatusOK)
 	r := resolverWithServer(fake.srv.URL)
 
-	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
 	req := &openai.ChatCompletionRequest{
 		Model: "gemini-1.5-pro",
 		Messages: []openai.ChatCompletionMessageParamUnion{
@@ -375,7 +422,7 @@ func TestResolver_CacheMiss_Creates(t *testing.T) {
 		},
 	}
 
-	res, err := r.Resolve(context.Background(), req, auth)
+	res, err := r.Resolve(context.Background(), req)
 	require.NoError(t, err)
 	require.NotNil(t, res)
 	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/new", res.CacheName)
@@ -390,7 +437,7 @@ func TestResolver_CacheMiss_Creates(t *testing.T) {
 
 // A cache that exists in Google but not in the store is not discovered on the request
 // path: the resolver creates rather than scanning cachedContents. Repairing that drift is
-// the reconciler's job.
+// the syncer's job.
 func TestResolver_RequestPath_NeverLists(t *testing.T) {
 	req := &openai.ChatCompletionRequest{
 		Model: "gemini-1.5-pro",
@@ -417,9 +464,8 @@ func TestResolver_RequestPath_NeverLists(t *testing.T) {
 	createResp := `{"name":"projects/p/locations/us-central1/cachedContents/new","expireTime":"` + expireISO + `"}`
 	fake := newFakeCacheServer(t, string(listBody), createResp, http.StatusOK)
 	r := resolverWithServer(fake.srv.URL)
-	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
 
-	res, err := r.Resolve(context.Background(), req, auth)
+	res, err := r.Resolve(context.Background(), req)
 	require.NoError(t, err)
 	require.NotNil(t, res)
 	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/new", res.CacheName)
@@ -443,8 +489,7 @@ func TestResolver_StoreHit_SkipsGoogleAPICalls(t *testing.T) {
 	key := computeKeyForRequest(t, req)
 	store.seed(key, "projects/p/locations/r/cachedContents/store-hit", time.Now().Add(10*time.Minute))
 
-	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
-	res, err := r.Resolve(context.Background(), req, auth)
+	res, err := r.Resolve(context.Background(), req)
 	require.NoError(t, err)
 	require.NotNil(t, res)
 	assert.Equal(t, "projects/p/locations/r/cachedContents/store-hit", res.CacheName)
@@ -471,8 +516,7 @@ func TestResolver_StoreEntryExpiring_Refetches(t *testing.T) {
 	// Seed with an entry expiring inside the stale window → must be treated as a miss.
 	store.seed(key, "projects/p/locations/us-central1/cachedContents/stale", time.Now().Add(5*time.Second))
 
-	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
-	res, err := r.Resolve(context.Background(), req, auth)
+	res, err := r.Resolve(context.Background(), req)
 	require.NoError(t, err)
 	require.NotNil(t, res)
 	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/refreshed", res.CacheName)
@@ -493,7 +537,6 @@ func TestResolver_CreateExpiryMissing_Fails(t *testing.T) {
 		`{"name":"projects/p/locations/us-central1/cachedContents/x"}`, http.StatusOK)
 	store := newMemStore()
 	r := resolverWithServer(fake.srv.URL, store)
-	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
 	req := &openai.ChatCompletionRequest{
 		Model: "gemini-1.5-pro",
 		Messages: []openai.ChatCompletionMessageParamUnion{
@@ -502,7 +545,7 @@ func TestResolver_CreateExpiryMissing_Fails(t *testing.T) {
 		},
 	}
 
-	res, err := r.Resolve(context.Background(), req, auth)
+	res, err := r.Resolve(context.Background(), req)
 	require.Error(t, err)
 	assert.Nil(t, res)
 	assert.Contains(t, err.Error(), "no expireTime")
@@ -513,7 +556,6 @@ func TestResolver_CreateExpiryUnparseable_Fails(t *testing.T) {
 	fake := newFakeCacheServer(t, `{"cachedContents":[]}`,
 		`{"name":"projects/p/locations/us-central1/cachedContents/x","expireTime":"not-a-time"}`, http.StatusOK)
 	r := resolverWithServer(fake.srv.URL)
-	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
 	req := &openai.ChatCompletionRequest{
 		Model: "gemini-1.5-pro",
 		Messages: []openai.ChatCompletionMessageParamUnion{
@@ -522,7 +564,7 @@ func TestResolver_CreateExpiryUnparseable_Fails(t *testing.T) {
 		},
 	}
 
-	res, err := r.Resolve(context.Background(), req, auth)
+	res, err := r.Resolve(context.Background(), req)
 	require.Error(t, err)
 	assert.Nil(t, res)
 }
@@ -534,7 +576,6 @@ func TestResolver_CreateFailure_ReturnsError(t *testing.T) {
 		http.StatusUnprocessableEntity,
 	)
 	r := resolverWithServer(fake.srv.URL)
-	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
 	req := &openai.ChatCompletionRequest{
 		Model: "gemini-1.5-pro",
 		Messages: []openai.ChatCompletionMessageParamUnion{
@@ -542,7 +583,7 @@ func TestResolver_CreateFailure_ReturnsError(t *testing.T) {
 			userMsg("q"),
 		},
 	}
-	_, err := r.Resolve(context.Background(), req, auth)
+	_, err := r.Resolve(context.Background(), req)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "422")
 }
@@ -567,7 +608,6 @@ func TestResolver_TTLDefault_SentToGoogle(t *testing.T) {
 	defer srv.Close()
 
 	r := resolverWithServer(srv.URL)
-	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
 	req := &openai.ChatCompletionRequest{
 		Model: "gemini-1.5-pro",
 		Messages: []openai.ChatCompletionMessageParamUnion{
@@ -575,12 +615,16 @@ func TestResolver_TTLDefault_SentToGoogle(t *testing.T) {
 			userMsg("q"),
 		},
 	}
-	_, err := r.Resolve(context.Background(), req, auth)
+	_, err := r.Resolve(context.Background(), req)
 	require.NoError(t, err)
 
 	var body gcp.CreateCachedContent
 	require.NoError(t, json.Unmarshal(capturedBody, &body))
 	assert.Equal(t, defaultTTL, body.TTL)
+	// The resolver sets a TTL, not an expiry. A zero-value expiry must not be sent, or
+	// Google would receive "0001-01-01T00:00:00Z" alongside the TTL.
+	assert.Nil(t, body.ExpireTime)
+	assert.NotContains(t, string(capturedBody), "expireTime")
 }
 
 func TestResolver_TTLOverride_SentToGoogle(t *testing.T) {
@@ -603,7 +647,6 @@ func TestResolver_TTLOverride_SentToGoogle(t *testing.T) {
 	defer srv.Close()
 
 	r := resolverWithServer(srv.URL)
-	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
 	req := &openai.ChatCompletionRequest{
 		Model: "gemini-1.5-pro",
 		Messages: []openai.ChatCompletionMessageParamUnion{
@@ -611,7 +654,7 @@ func TestResolver_TTLOverride_SentToGoogle(t *testing.T) {
 			userMsg("q"),
 		},
 	}
-	_, err := r.Resolve(context.Background(), req, auth)
+	_, err := r.Resolve(context.Background(), req)
 	require.NoError(t, err)
 
 	var body gcp.CreateCachedContent
@@ -660,8 +703,7 @@ func TestResolver_DuplicateCreateRace_KeepsOwnCreate(t *testing.T) {
 	defer srv.Close()
 
 	r := resolverWithServer(srv.URL)
-	auth := &fakeGCPAuth{token: "tok", region: "us-central1", project: "p"}
-	res, err := r.Resolve(context.Background(), req, auth)
+	res, err := r.Resolve(context.Background(), req)
 	require.NoError(t, err)
 	require.NotNil(t, res)
 	assert.Equal(t, "projects/p/locations/us-central1/cachedContents/new-by-us", res.CacheName)

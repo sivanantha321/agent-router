@@ -1413,7 +1413,7 @@ Leaving it unset disables caching entirely, and markers are ignored.
   name="url"
   type="string"
   required="true"
-  description="URL locates the shared Redis store that records which cachedContents entry a given<br />request prefix resolved to. Sharing that state across gateway replicas is what<br />prevents two replicas from independently creating a cache for the same prefix.<br />It is given either as a bare `host:port`<br />(e.g. `redis.default.svc.cluster.local:6379`) or as a full `redis://` URL.<br />If Redis is unreachable at request time, caching is skipped and the request is<br />served uncached rather than failed."
+  description="URL locates the shared Redis store that records which cachedContents entry a given<br />request prefix resolved to.<br />It is given either as a bare `host:port`<br />(e.g. `redis.default.svc.cluster.local:6379`) or as a full `redis://` URL.<br />If Redis is unreachable at request time, caching is skipped and the request is<br />served uncached rather than failed."
 />
 
 
@@ -4072,7 +4072,7 @@ Leaving it unset disables caching entirely, and markers are ignored.
   name="url"
   type="string"
   required="true"
-  description="URL locates the shared Redis store that records which cachedContents entry a given<br />request prefix resolved to. Sharing that state across gateway replicas is what<br />prevents two replicas from independently creating a cache for the same prefix.<br />It is given either as a bare `host:port`<br />(e.g. `redis.default.svc.cluster.local:6379`) or as a full `redis://` URL.<br />If Redis is unreachable at request time, caching is skipped and the request is<br />served uncached rather than failed."
+  description="URL locates the shared Redis store that records which cachedContents entry a given<br />request prefix resolved to.<br />It is given either as a bare `host:port`<br />(e.g. `redis.default.svc.cluster.local:6379`) or as a full `redis://` URL.<br />If Redis is unreachable at request time, caching is skipped and the request is<br />served uncached rather than failed."
 />
 
 

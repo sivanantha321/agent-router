@@ -13,14 +13,6 @@
 //  3. Generates a deterministic SHA-256 cache key and looks it up in the shared store.
 //  4. On a store miss, creates the cache entry, publishes it to the store, and returns
 //     the cache resource name and the non-cached messages.
-//
-// The shared store deduplicates callers separated in time: once any replica publishes a
-// cache name, every replica reuses it. Replicas that miss the same cold prefix at the
-// same moment each create their own cache; this is tolerated, and each create is billed
-// and reported.
-//
-// The CacheResolver interface allows the implementation to be replaced with an external
-// cache service in the future without changing the request-path callers.
 package gcpcache
 
 import (
@@ -53,35 +45,8 @@ const (
 	gcpCachedContentsBasePath = "https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/cachedContents"
 )
 
-// ResolveResult holds the outcome of a successful cache resolution.
-type ResolveResult struct {
-	// CacheName is the full Google resource name of the resolved or created cache entry.
-	// Format: "projects/{project}/locations/{location}/cachedContents/{cache_id}"
-	CacheName string
-	// Messages is the non-cached remainder of the conversation (messages after the breakpoint).
-	Messages []openai.ChatCompletionMessageParamUnion
-	// Created is true when this call created a new cache entry (cache-write cost applies).
-	Created bool
-	// TokenCount is the number of tokens stored in the cache (from Google's create response).
-	// Only populated when Created is true.
-	TokenCount int
-	// ExpireTime is the cache expiration time reported by Google.
-	ExpireTime time.Time
-}
-
-// CacheResolver resolves or creates a GCP Vertex AI cached content entry for requests
-// that carry Anthropic-style cache_control markers.
-type CacheResolver interface {
-	// Resolve inspects openAIReq for cache_control markers, resolves or creates the
-	// corresponding Google cachedContents entry, and returns the result.
-	// The caller is responsible for injecting ResolveResult.CacheName as the
-	// cachedContent field on the Gemini request and replacing the request messages
-	// with ResolveResult.Messages.
-	Resolve(ctx context.Context, openAIReq *openai.ChatCompletionRequest, gcpAuth filterapi.GCPAuthHandler) (*ResolveResult, error)
-}
-
-// resolver is the default CacheResolver implementation.
-type resolver struct {
+// Resolver is the GCP Vertex AI contextcache.CacheResolver and contextcache.CacheSyncer.
+type Resolver struct {
 	httpClient *http.Client
 
 	// store holds resolved cache names. Backed by Redis it is shared across replicas, so
@@ -94,46 +59,40 @@ type resolver struct {
 	// proceeds normally.
 	logger *slog.Logger
 
-	// mu guards the background reconciler's lifecycle.
+	// mu guards auth and the background syncer's lifecycle.
 	mu sync.Mutex
-	// cancel stops the reconciler; nil until Start runs one.
+	// auth is the backend's current credentials. Resolve uses them to create caches and
+	// the background syncer uses them to list them. Nil makes the resolver inert. It is
+	// replaced by SetAuth on every config reload, so rotated tokens and changed
+	// project/region take effect without rebuilding the resolver.
+	auth filterapi.GCPAuthHandler
+	// cancel stops the syncer; nil until Start runs one.
 	cancel context.CancelFunc
-	// done is closed when the reconciler goroutine exits.
+	// done is closed when the syncer goroutine exits.
 	done chan struct{}
 	// closed is set by Close, after which Start does nothing.
 	closed bool
 }
 
-// reconcileInterval is how often the background reconciler runs a round. Between rounds,
+// syncInterval is how often the background syncer runs a round. Between rounds,
 // a cache the store has forgotten is not rediscovered, so this bounds how long drift
 // persists. It is sized against the 300s default cache TTL.
-const reconcileInterval = 60 * time.Second
+const syncInterval = 60 * time.Second
 
-// Background is implemented by resolvers that run background work. It is kept out of
-// CacheResolver so that request-path callers need not know about it; LoadConfig reaches
-// it through a type assertion.
-type Background interface {
-	// Start begins background reconciliation for gcpAuth's project and region. It runs
-	// under a context the resolver owns, not the caller's, so it outlives the call. It
-	// does nothing if already started, if closed, or if the store cannot reconcile.
-	Start(gcpAuth filterapi.GCPAuthHandler)
-	// Close stops background work and waits for it to exit. It is idempotent.
-	io.Closer
-}
+var _ contextcache.CacheResolver = (*Resolver)(nil)
 
-var _ Background = (*resolver)(nil)
+var _ contextcache.CacheSyncer = (*Resolver)(nil)
 
-// Start implements Background.
-func (r *resolver) Start(gcpAuth filterapi.GCPAuthHandler) {
+// Start implements contextcache.CacheSyncer. It does nothing if the resolver was built
+// without credentials.
+func (r *Resolver) Start() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed || r.cancel != nil {
+	if r.closed || r.cancel != nil || r.auth == nil {
 		return
 	}
-	rc, ok := r.newReconciler(gcpAuth, reconcileInterval)
-	if !ok {
-		return
-	}
+	// A nil auth makes the syncer read the resolver's current credentials each round.
+	rc := r.newSyncer(nil, syncInterval)
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
 	r.done = make(chan struct{})
@@ -143,8 +102,25 @@ func (r *resolver) Start(gcpAuth filterapi.GCPAuthHandler) {
 	}()
 }
 
-// Close implements Background.
-func (r *resolver) Close() error {
+// SetAuth replaces the credentials used by Resolve and the background syncer. LoadConfig
+// calls it on every reload, because the auth handler is rebuilt each time (the access
+// token is rotated by the controller) while the resolver is reused.
+func (r *Resolver) SetAuth(auth filterapi.GCPAuthHandler) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.auth = auth
+}
+
+// GetAuth returns the credentials in effect. It takes the lock because SetAuth may run
+// concurrently from a config reload.
+func (r *Resolver) GetAuth() filterapi.GCPAuthHandler {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.auth
+}
+
+// Close implements contextcache.CacheSyncer.
+func (r *Resolver) Close() error {
 	r.mu.Lock()
 	r.closed = true
 	cancel, done := r.cancel, r.done
@@ -156,12 +132,13 @@ func (r *resolver) Close() error {
 	return nil
 }
 
-// New creates a new CacheResolver.
+// New creates a new Resolver.
 //
-// httpClient is used for calls to the Google cachedContents API; pass nil for a default.
+// httpClient is used for calls to the GCP cachedContents API; pass nil for a default.
 // store holds resolved cache names; pass nil to disable caching entirely, which makes
-// resolution inert rather than failing requests. logger may be nil.
-func New(httpClient *http.Client, store contextcache.Store, logger *slog.Logger) CacheResolver {
+// resolution inert rather than failing requests. auth is the backend's credentials, used
+// for both resolving and syncing; nil makes the resolver inert. logger may be nil.
+func New(httpClient *http.Client, store contextcache.Store, auth filterapi.GCPAuthHandler, logger *slog.Logger) *Resolver {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
@@ -171,11 +148,16 @@ func New(httpClient *http.Client, store contextcache.Store, logger *slog.Logger)
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &resolver{httpClient: httpClient, store: store, logger: logger}
+	return &Resolver{httpClient: httpClient, store: store, logger: logger, auth: auth}
 }
 
-// Resolve implements CacheResolver.
-func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletionRequest, gcpAuth filterapi.GCPAuthHandler) (*ResolveResult, error) {
+// Resolve implements contextcache.CacheResolver.
+func (r *Resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletionRequest) (*contextcache.ResolveResult, error) {
+	// Without credentials nothing can be created, so caching is inert.
+	auth := r.GetAuth()
+	if auth == nil {
+		return nil, nil
+	}
 	// Find the last cache_control breakpoint in the message list.
 	breakpoint := findBreakpoint(openAIReq.Messages)
 	if breakpoint < 0 {
@@ -201,16 +183,16 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 	}
 
 	// Compute a deterministic cache key.
-	cacheKey, err := computeCacheKey(openAIReq.Model, contents, systemInstruction, geminiTools)
+	cacheKey, err := computeCacheKey(auth.GCPProject(), auth.GCPRegion(), openAIReq.Model, contents, systemInstruction, geminiTools)
 	if err != nil {
 		return nil, fmt.Errorf("gcpcache: failed to compute cache key: %w", err)
 	}
 
 	// Check the shared store first. A store failure is not fatal: it is logged and
 	// treated as a miss, so an unreachable store degrades caching rather than the
-	// request. Google-side failures below are a different matter and do fail fast.
+	// request. GCP-side failures below are a different matter and do fail fast.
 	if e, ok := r.storeGet(ctx, cacheKey); ok {
-		return &ResolveResult{
+		return &contextcache.ResolveResult{
 			CacheName:  e.Name,
 			Messages:   remainderMessages,
 			ExpireTime: e.ExpireTime,
@@ -219,7 +201,7 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 
 	// Store miss — create against GCP. See resolveUncached for how concurrent
 	// resolutions of the same key behave.
-	result, err := r.resolveUncached(ctx, openAIReq, gcpAuth, cacheKey, ttl, contents, systemInstruction, geminiTools)
+	result, err := r.resolveUncached(ctx, openAIReq, auth, cacheKey, ttl, contents, systemInstruction, geminiTools)
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +212,7 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 	return result, nil
 }
 
-// resolveUncached creates a Google cachedContents entry for a cache key that missed the
+// resolveUncached creates a GCP cachedContents entry for a cache key that missed the
 // store, and publishes it. It deals only in the cached prefix, so it leaves
 // ResolveResult.Messages unset for the caller to fill in per-request.
 //
@@ -238,7 +220,7 @@ func (r *resolver) Resolve(ctx context.Context, openAIReq *openai.ChatCompletion
 // same cold prefix at the same moment each create; each keeps and bills its own cache
 // (Created is true, so the write shows up in cache-write token metrics), and the surplus
 // expires with its TTL.
-func (r *resolver) resolveUncached(
+func (r *Resolver) resolveUncached(
 	ctx context.Context,
 	openAIReq *openai.ChatCompletionRequest,
 	gcpAuth filterapi.GCPAuthHandler,
@@ -246,7 +228,7 @@ func (r *resolver) resolveUncached(
 	contents []genai.Content,
 	systemInstruction *genai.Content,
 	geminiTools []genai.Tool,
-) (*ResolveResult, error) {
+) (*contextcache.ResolveResult, error) {
 	region := gcpAuth.GCPRegion()
 	project := gcpAuth.GCPProject()
 
@@ -259,7 +241,7 @@ func (r *resolver) resolveUncached(
 
 	// Create without waiting on other replicas. A replica racing on the same cold prefix
 	// may create too; each keeps the cache it created, and the store holds whichever name
-	// was published last. Both are valid Google caches.
+	// was published last. Both are valid GCP caches.
 	baseURL := fmt.Sprintf(gcpCachedContentsBasePath, region, project, region)
 	created, tokenCount, expireTime, err := r.createCache(ctx, baseURL, accessToken, openAIReq.Model, region, project, cacheKey, contents, systemInstruction, geminiTools, ttl)
 	if err != nil {
@@ -267,7 +249,7 @@ func (r *resolver) resolveUncached(
 	}
 
 	r.storeSet(ctx, cacheKey, contextcache.Entry{Name: created, ExpireTime: expireTime})
-	return &ResolveResult{
+	return &contextcache.ResolveResult{
 		CacheName:  created,
 		Created:    true,
 		TokenCount: tokenCount,
@@ -280,15 +262,15 @@ func (r *resolver) resolveUncached(
 //
 // The resolver never propagates a store failure to its caller: caching is an
 // optimization, and an unreachable store must not turn a servable request into an
-// error. Failures are logged and treated as a miss, leaving Google as the source of
-// truth. Google-side failures are propagated, because those are actionable by the
+// error. Failures are logged and treated as a miss, leaving GCP as the source of
+// truth. GCP-side failures are propagated, because those are actionable by the
 // user — a create rejected for being below the model's minimum token count means the
 // cache_control markers are misplaced, and silently serving the request uncached
 // would hide a cost increase.
 // -----------------------------------------------------------------------
 
 // storeGet reads a resolved cache name, reporting a miss on any failure.
-func (r *resolver) storeGet(ctx context.Context, key string) (contextcache.Entry, bool) {
+func (r *Resolver) storeGet(ctx context.Context, key string) (contextcache.Entry, bool) {
 	e, ok, err := r.store.Get(ctx, key)
 	if err != nil {
 		r.logger.Warn("gcpcache: cache store read failed, proceeding uncached",
@@ -306,9 +288,9 @@ func (r *resolver) storeGet(ctx context.Context, key string) (contextcache.Entry
 	return e, true
 }
 
-// storeSet records a resolved cache name, expiring it with the Google entry itself so
+// storeSet records a resolved cache name, expiring it with the GCP entry itself so
 // the store cannot outlive what it points at.
-func (r *resolver) storeSet(ctx context.Context, key string, e contextcache.Entry) {
+func (r *Resolver) storeSet(ctx context.Context, key string, e contextcache.Entry) {
 	ttl := time.Until(e.ExpireTime)
 	if ttl <= 0 {
 		return
@@ -446,6 +428,11 @@ func computeKeyInputs(model string, cachedMessages []openai.ChatCompletionMessag
 // -----------------------------------------------------------------------
 
 type cacheKeyInput struct {
+	// Project and Region scope the key to where the cache lives: a cachedContents name is
+	// only usable in its own project and region, and backends in different locations may
+	// share one Redis.
+	Project           string          `json:"project"`
+	Region            string          `json:"region"`
 	Model             string          `json:"model"`
 	Contents          []genai.Content `json:"contents"`
 	SystemInstruction *genai.Content  `json:"systemInstruction,omitempty"`
@@ -453,10 +440,12 @@ type cacheKeyInput struct {
 }
 
 // computeCacheKey generates a deterministic SHA-256 hex digest over the
-// (model, contents, systemInstruction, tools) tuple. The digest is used as the
-// Google cachedContents displayName.
-func computeCacheKey(model string, contents []genai.Content, systemInstruction *genai.Content, tools []genai.Tool) (string, error) {
+// (project, region, model, contents, systemInstruction, tools) tuple. The digest is used
+// as the GCP cachedContents displayName.
+func computeCacheKey(project, region, model string, contents []genai.Content, systemInstruction *genai.Content, tools []genai.Tool) (string, error) {
 	input := cacheKeyInput{
+		Project:           project,
+		Region:            region,
 		Model:             model,
 		Contents:          contents,
 		SystemInstruction: systemInstruction,
@@ -471,12 +460,12 @@ func computeCacheKey(model string, contents []genai.Content, systemInstruction *
 }
 
 // -----------------------------------------------------------------------
-// Google cachedContents REST API calls
+// GCP cachedContents REST API calls
 // -----------------------------------------------------------------------
 
 // createCache creates a cached content in GCP and returns the new cache's resource name,
 // token count, and expiry time.
-func (r *resolver) createCache(
+func (r *Resolver) createCache(
 	ctx context.Context,
 	baseURL, accessToken, model, region, project, cacheKey string,
 	contents []genai.Content,

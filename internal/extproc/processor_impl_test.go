@@ -31,9 +31,9 @@ import (
 	"github.com/envoyproxy/ai-gateway/internal/apischema/openai"
 	"github.com/envoyproxy/ai-gateway/internal/backendauth"
 	"github.com/envoyproxy/ai-gateway/internal/bodymutator"
+	"github.com/envoyproxy/ai-gateway/internal/contextcache"
 	"github.com/envoyproxy/ai-gateway/internal/endpointspec"
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
-	"github.com/envoyproxy/ai-gateway/internal/gcpcache"
 	"github.com/envoyproxy/ai-gateway/internal/headermutator"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 	"github.com/envoyproxy/ai-gateway/internal/json"
@@ -2525,25 +2525,25 @@ func mustCompileCEL(t *testing.T, expr string) cel.Program {
 // GCP context-cache resolver wiring tests
 // ---------------------------------------------------------------------------
 
-// mockGCPCacheResolver is a controllable gcpcache.CacheResolver for testing.
-type mockGCPCacheResolver struct {
-	retResult *gcpcache.ResolveResult
+// mockCacheResolver is a controllable contextcache.CacheResolver for testing.
+type mockCacheResolver struct {
+	retResult *contextcache.ResolveResult
 	retErr    error
 	called    bool
 }
 
-func (m *mockGCPCacheResolver) Resolve(_ context.Context, _ *openai.ChatCompletionRequest, _ filterapi.GCPAuthHandler) (*gcpcache.ResolveResult, error) {
+func (m *mockCacheResolver) Resolve(_ context.Context, _ *openai.ChatCompletionRequest) (*contextcache.ResolveResult, error) {
 	m.called = true
 	return m.retResult, m.retErr
 }
 
-// mockGCPCacheTranslator extends mockTranslator with GCPCacheSetter support.
-type mockGCPCacheTranslator struct {
+// mockCacheTranslator extends mockTranslator with ContextCacheSetter support.
+type mockCacheTranslator struct {
 	mockTranslator
-	setCacheResult *translator.GCPCacheResult
+	setCacheResult *translator.ContextCacheResult
 }
 
-func (m *mockGCPCacheTranslator) SetGCPCacheResult(result *translator.GCPCacheResult) {
+func (m *mockCacheTranslator) SetContextCacheResult(result *translator.ContextCacheResult) {
 	m.setCacheResult = result
 }
 
@@ -2561,15 +2561,15 @@ func (m *mockGCPAuthHandler) GCPTokenSource() oauth2.TokenSource {
 func (m *mockGCPAuthHandler) GCPRegion() string  { return "us-central1" }
 func (m *mockGCPAuthHandler) GCPProject() string { return "test-project" }
 
-// Test_upstreamProcessor_GCPCacheResolver_notCalled verifies that the resolver is not invoked
-// when the translator does not implement GCPCacheSetter.
-func Test_upstreamProcessor_GCPCacheResolver_notCalled(t *testing.T) {
+// Test_upstreamProcessor_CacheResolver_notCalled verifies that the resolver is not invoked
+// when the translator does not implement ContextCacheSetter.
+func Test_upstreamProcessor_CacheResolver_notCalled(t *testing.T) {
 	someBody := bodyFromModel(t, "gemini-1.5-pro", false, nil)
 	var body openai.ChatCompletionRequest
 	require.NoError(t, json.Unmarshal(someBody, &body))
 
-	cr := &mockGCPCacheResolver{}
-	// mockTranslator does not implement GCPCacheSetter.
+	cr := &mockCacheResolver{}
+	// mockTranslator does not implement ContextCacheSetter.
 	tr := &mockTranslator{t: t, expRequestBody: &body}
 	mm := &mockMetrics{}
 
@@ -2589,18 +2589,18 @@ func Test_upstreamProcessor_GCPCacheResolver_notCalled(t *testing.T) {
 	}
 	_, err := p.ProcessRequestHeaders(t.Context(), nil)
 	require.NoError(t, err)
-	require.False(t, cr.called, "resolver must not be called when translator lacks GCPCacheSetter")
+	require.False(t, cr.called, "resolver must not be called when translator lacks ContextCacheSetter")
 }
 
-// Test_upstreamProcessor_GCPCacheResolver_noMarkers verifies that when the resolver returns nil
+// Test_upstreamProcessor_CacheResolver_noMarkers verifies that when the resolver returns nil
 // (no cache_control markers), the translator is called without a cache result.
-func Test_upstreamProcessor_GCPCacheResolver_noMarkers(t *testing.T) {
+func Test_upstreamProcessor_CacheResolver_noMarkers(t *testing.T) {
 	someBody := bodyFromModel(t, "gemini-1.5-pro", false, nil)
 	var body openai.ChatCompletionRequest
 	require.NoError(t, json.Unmarshal(someBody, &body))
 
-	cr := &mockGCPCacheResolver{retResult: nil} // no markers
-	tr := &mockGCPCacheTranslator{mockTranslator: mockTranslator{t: t, expRequestBody: &body}}
+	cr := &mockCacheResolver{retResult: nil} // no markers
+	tr := &mockCacheTranslator{mockTranslator: mockTranslator{t: t, expRequestBody: &body}}
 	mm := &mockMetrics{}
 
 	p := &chatCompletionProcessorUpstreamFilter{
@@ -2620,22 +2620,22 @@ func Test_upstreamProcessor_GCPCacheResolver_noMarkers(t *testing.T) {
 	_, err := p.ProcessRequestHeaders(t.Context(), nil)
 	require.NoError(t, err)
 	require.True(t, cr.called)
-	require.Nil(t, tr.setCacheResult, "SetGCPCacheResult must not be called when resolver returns nil")
+	require.Nil(t, tr.setCacheResult, "SetContextCacheResult must not be called when resolver returns nil")
 }
 
-// Test_upstreamProcessor_GCPCacheResolver_hit verifies that a cache hit is injected into the translator.
-func Test_upstreamProcessor_GCPCacheResolver_hit(t *testing.T) {
+// Test_upstreamProcessor_CacheResolver_hit verifies that a cache hit is injected into the translator.
+func Test_upstreamProcessor_CacheResolver_hit(t *testing.T) {
 	someBody := bodyFromModel(t, "gemini-1.5-pro", false, nil)
 	var body openai.ChatCompletionRequest
 	require.NoError(t, json.Unmarshal(someBody, &body))
 
 	filteredMessages := []openai.ChatCompletionMessageParamUnion{}
-	cr := &mockGCPCacheResolver{retResult: &gcpcache.ResolveResult{
+	cr := &mockCacheResolver{retResult: &contextcache.ResolveResult{
 		CacheName: "projects/p/locations/us-central1/cachedContents/abc123",
 		Messages:  filteredMessages,
 		Created:   false,
 	}}
-	tr := &mockGCPCacheTranslator{mockTranslator: mockTranslator{t: t, expRequestBody: &body}}
+	tr := &mockCacheTranslator{mockTranslator: mockTranslator{t: t, expRequestBody: &body}}
 	mm := &mockMetrics{}
 
 	p := &chatCompletionProcessorUpstreamFilter{
@@ -2662,19 +2662,19 @@ func Test_upstreamProcessor_GCPCacheResolver_hit(t *testing.T) {
 	require.Zero(t, tr.setCacheResult.WriteTokenCount)
 }
 
-// Test_upstreamProcessor_GCPCacheResolver_created verifies that cache-write tokens are propagated.
-func Test_upstreamProcessor_GCPCacheResolver_created(t *testing.T) {
+// Test_upstreamProcessor_CacheResolver_created verifies that cache-write tokens are propagated.
+func Test_upstreamProcessor_CacheResolver_created(t *testing.T) {
 	someBody := bodyFromModel(t, "gemini-1.5-pro", false, nil)
 	var body openai.ChatCompletionRequest
 	require.NoError(t, json.Unmarshal(someBody, &body))
 
-	cr := &mockGCPCacheResolver{retResult: &gcpcache.ResolveResult{
+	cr := &mockCacheResolver{retResult: &contextcache.ResolveResult{
 		CacheName:  "projects/p/locations/us-central1/cachedContents/new456",
 		Messages:   []openai.ChatCompletionMessageParamUnion{},
 		Created:    true,
 		TokenCount: 512,
 	}}
-	tr := &mockGCPCacheTranslator{mockTranslator: mockTranslator{t: t, expRequestBody: &body}}
+	tr := &mockCacheTranslator{mockTranslator: mockTranslator{t: t, expRequestBody: &body}}
 	mm := &mockMetrics{}
 
 	p := &chatCompletionProcessorUpstreamFilter{
@@ -2699,14 +2699,60 @@ func Test_upstreamProcessor_GCPCacheResolver_created(t *testing.T) {
 	require.Equal(t, uint32(512), tr.setCacheResult.WriteTokenCount)
 }
 
-// Test_upstreamProcessor_GCPCacheResolver_error verifies that a resolver error produces a 502.
-func Test_upstreamProcessor_GCPCacheResolver_error(t *testing.T) {
+// A hit must not be billed as a write even if the resolver reports a token count.
+func Test_upstreamProcessor_CacheResolver_hitIgnoresTokenCount(t *testing.T) {
 	someBody := bodyFromModel(t, "gemini-1.5-pro", false, nil)
 	var body openai.ChatCompletionRequest
 	require.NoError(t, json.Unmarshal(someBody, &body))
 
-	cr := &mockGCPCacheResolver{retErr: errors.New("GCP API quota exceeded")}
-	tr := &mockGCPCacheTranslator{mockTranslator: mockTranslator{t: t, expRequestBody: &body}}
+	cr := &mockCacheResolver{retResult: &contextcache.ResolveResult{
+		CacheName: "c/hit", Messages: []openai.ChatCompletionMessageParamUnion{}, Created: false, TokenCount: 99,
+	}}
+	tr := &mockCacheTranslator{mockTranslator: mockTranslator{t: t, expRequestBody: &body}}
+	p := &chatCompletionProcessorUpstreamFilter{
+		parent: &chatCompletionProcessorRouterFilter{
+			config: &filterapi.RuntimeConfig{}, logger: slog.Default(),
+			originalRequestBodyRaw: someBody, originalRequestBody: &body, originalModel: "gemini-1.5-pro",
+		},
+		requestHeaders: map[string]string{internalapi.ModelNameHeaderKeyDefault: "gemini-1.5-pro"},
+		metrics:        &mockMetrics{}, translator: tr, handler: &mockGCPAuthHandler{}, cacheResolver: cr,
+	}
+	_, err := p.ProcessRequestHeaders(t.Context(), nil)
+	require.NoError(t, err)
+	require.NotNil(t, tr.setCacheResult)
+	require.Zero(t, tr.setCacheResult.WriteTokenCount)
+}
+
+// A request that names its own cache must not be resolved, so no cache is created for it.
+func Test_upstreamProcessor_CacheResolver_explicitCachedContentSkips(t *testing.T) {
+	someBody := bodyFromModel(t, "gemini-1.5-pro", false, nil)
+	var body openai.ChatCompletionRequest
+	require.NoError(t, json.Unmarshal(someBody, &body))
+	body.GCPVertexAIVendorFields = &openai.GCPVertexAIVendorFields{CachedContent: "c/explicit"}
+
+	cr := &mockCacheResolver{}
+	tr := &mockCacheTranslator{mockTranslator: mockTranslator{t: t, expRequestBody: &body}}
+	p := &chatCompletionProcessorUpstreamFilter{
+		parent: &chatCompletionProcessorRouterFilter{
+			config: &filterapi.RuntimeConfig{}, logger: slog.Default(),
+			originalRequestBodyRaw: someBody, originalRequestBody: &body, originalModel: "gemini-1.5-pro",
+		},
+		requestHeaders: map[string]string{internalapi.ModelNameHeaderKeyDefault: "gemini-1.5-pro"},
+		metrics:        &mockMetrics{}, translator: tr, handler: &mockGCPAuthHandler{}, cacheResolver: cr,
+	}
+	_, _ = p.ProcessRequestHeaders(t.Context(), nil)
+	require.False(t, cr.called)
+	require.Nil(t, tr.setCacheResult)
+}
+
+// Test_upstreamProcessor_CacheResolver_error verifies that a resolver error produces a 502.
+func Test_upstreamProcessor_CacheResolver_error(t *testing.T) {
+	someBody := bodyFromModel(t, "gemini-1.5-pro", false, nil)
+	var body openai.ChatCompletionRequest
+	require.NoError(t, json.Unmarshal(someBody, &body))
+
+	cr := &mockCacheResolver{retErr: errors.New("GCP API quota exceeded")}
+	tr := &mockCacheTranslator{mockTranslator: mockTranslator{t: t, expRequestBody: &body}}
 	mm := &mockMetrics{}
 
 	p := &chatCompletionProcessorUpstreamFilter{
@@ -2732,35 +2778,4 @@ func Test_upstreamProcessor_GCPCacheResolver_error(t *testing.T) {
 	require.Equal(t, typev3.StatusCode(502), immediateResp.ImmediateResponse.Status.Code)
 	require.Contains(t, string(immediateResp.ImmediateResponse.Body), "upstream cache service error")
 	mm.RequireRequestFailure(t)
-}
-
-// Test_upstreamProcessor_GCPCacheResolver_noHandler verifies the resolver is skipped
-// when the handler is not a GCPAuthHandler.
-func Test_upstreamProcessor_GCPCacheResolver_noHandler(t *testing.T) {
-	someBody := bodyFromModel(t, "gemini-1.5-pro", false, nil)
-	var body openai.ChatCompletionRequest
-	require.NoError(t, json.Unmarshal(someBody, &body))
-
-	cr := &mockGCPCacheResolver{}
-	tr := &mockGCPCacheTranslator{mockTranslator: mockTranslator{t: t, expRequestBody: &body}}
-	mm := &mockMetrics{}
-
-	p := &chatCompletionProcessorUpstreamFilter{
-		parent: &chatCompletionProcessorRouterFilter{
-			config:                 &filterapi.RuntimeConfig{},
-			logger:                 slog.Default(),
-			originalRequestBodyRaw: someBody,
-			originalRequestBody:    &body,
-			originalModel:          "gemini-1.5-pro",
-		},
-		requestHeaders: map[string]string{internalapi.ModelNameHeaderKeyDefault: "gemini-1.5-pro"},
-		metrics:        mm,
-		translator:     tr,
-		handler:        &mockBackendAuthHandler{}, // not a GCPAuthHandler
-		cacheResolver:  cr,
-	}
-	_, err := p.ProcessRequestHeaders(t.Context(), nil)
-	require.NoError(t, err)
-	require.False(t, cr.called, "resolver must not be called when handler is not GCPAuthHandler")
-	require.Nil(t, tr.setCacheResult)
 }

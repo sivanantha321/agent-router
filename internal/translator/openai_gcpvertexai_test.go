@@ -2922,15 +2922,15 @@ func TestGCPVertexAIRedactBody(t *testing.T) {
 	})
 }
 
-// TestOpenAIToGCPVertexAITranslator_GCPCacheSetter verifies that SetGCPCacheResult
+// TestOpenAIToGCPVertexAITranslator_ContextCacheSetter verifies that SetContextCacheResult
 // correctly injects the cache name into the Gemini request, replaces the message list
 // with the filtered remainder, and records cache-write tokens in ResponseBody.
-func TestOpenAIToGCPVertexAITranslator_GCPCacheSetter(t *testing.T) {
+func TestOpenAIToGCPVertexAITranslator_ContextCacheSetter(t *testing.T) {
 	t.Run("cache name injected into Gemini request", func(t *testing.T) {
 		tr := NewChatCompletionOpenAIToGCPVertexAITranslator("").(*openAIToGCPVertexAITranslatorV1ChatCompletion)
 
 		// Seed a cache result before RequestBody.
-		tr.SetGCPCacheResult(&GCPCacheResult{
+		tr.SetContextCacheResult(&ContextCacheResult{
 			CacheName:        "projects/p/locations/us-central1/cachedContents/abc",
 			FilteredMessages: []openai.ChatCompletionMessageParamUnion{},
 			Created:          true,
@@ -2953,16 +2953,47 @@ func TestOpenAIToGCPVertexAITranslator_GCPCacheSetter(t *testing.T) {
 		// The Gemini request should carry the cachedContent field.
 		require.Contains(t, string(bodyBytes), `"cachedContent":"projects/p/locations/us-central1/cachedContents/abc"`)
 
-		// pendingCacheResult should be cleared after RequestBody.
-		require.Nil(t, tr.pendingCacheResult)
 		// cacheWriteTokens should be set for response attribution.
 		require.Equal(t, uint32(256), tr.cacheWriteTokens)
+	})
+
+	t.Run("cached request drops tools, tool config and system instruction", func(t *testing.T) {
+		tr := NewChatCompletionOpenAIToGCPVertexAITranslator("").(*openAIToGCPVertexAITranslatorV1ChatCompletion)
+		tr.SetContextCacheResult(&ContextCacheResult{
+			CacheName: "projects/p/locations/us-central1/cachedContents/abc",
+			FilteredMessages: []openai.ChatCompletionMessageParamUnion{
+				{OfSystem: &openai.ChatCompletionSystemMessageParam{
+					Content: openai.ContentUnion{Value: "late system"},
+					Role:    openai.ChatMessageRoleSystem,
+				}},
+				{OfUser: &openai.ChatCompletionUserMessageParam{
+					Content: openai.StringOrUserRoleContentUnion{Value: "hello"},
+					Role:    openai.ChatMessageRoleUser,
+				}},
+			},
+		})
+		req := &openai.ChatCompletionRequest{
+			Model: "gemini-1.5-pro",
+			Tools: []openai.Tool{{
+				Type:     openai.ToolTypeFunction,
+				Function: &openai.FunctionDefinition{Name: "get_weather"},
+			}},
+			ToolChoice: &openai.ChatCompletionToolChoiceUnion{Value: "auto"},
+		}
+		_, bodyBytes, err := tr.RequestBody(nil, req, false)
+		require.NoError(t, err)
+		body := string(bodyBytes)
+		require.Contains(t, body, `"cachedContent"`)
+		require.NotContains(t, body, "get_weather")
+		require.NotContains(t, body, `"toolConfig":{`)
+		require.NotContains(t, body, "late system")
+		require.Contains(t, body, "hello")
 	})
 
 	t.Run("cache hit does not set write tokens", func(t *testing.T) {
 		tr := NewChatCompletionOpenAIToGCPVertexAITranslator("").(*openAIToGCPVertexAITranslatorV1ChatCompletion)
 
-		tr.SetGCPCacheResult(&GCPCacheResult{
+		tr.SetContextCacheResult(&ContextCacheResult{
 			CacheName:       "projects/p/locations/us-central1/cachedContents/existing",
 			Created:         false,
 			WriteTokenCount: 0,
@@ -2975,6 +3006,14 @@ func TestOpenAIToGCPVertexAITranslator_GCPCacheSetter(t *testing.T) {
 		_, _, err := tr.RequestBody(nil, req, false)
 		require.NoError(t, err)
 		require.Equal(t, uint32(0), tr.cacheWriteTokens)
+	})
+
+	t.Run("a hit reports no write tokens even if a count is set", func(t *testing.T) {
+		tr := NewChatCompletionOpenAIToGCPVertexAITranslator("").(*openAIToGCPVertexAITranslatorV1ChatCompletion)
+		tr.SetContextCacheResult(&ContextCacheResult{CacheName: "c/hit", Created: false, WriteTokenCount: 99})
+		_, _, err := tr.RequestBody(nil, &openai.ChatCompletionRequest{Model: "gemini-1.5-pro"}, false)
+		require.NoError(t, err)
+		require.Zero(t, tr.cacheWriteTokens)
 	})
 
 	t.Run("cache write tokens appear in non-streaming ResponseBody", func(t *testing.T) {

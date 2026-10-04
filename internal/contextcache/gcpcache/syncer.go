@@ -21,26 +21,21 @@ import (
 	"github.com/envoyproxy/ai-gateway/internal/json"
 )
 
-// This file supplies the GCP side of reconciliation: a contextcache.Source that walks
+// This file supplies the GCP side of syncing: a contextcache.Source that walks
 // cachedContents.list for one project and region. The loop, gate, and store writes live
-// in contextcache.Reconciler.
+// in contextcache.Syncer.
 
 const (
 	// listPageSize is the documented maximum for cachedContents.list; larger values are
 	// coerced down by the API. Requesting it explicitly avoids an unspecified default.
 	listPageSize = 1000
 
-	// listMaxPages bounds one round's walk, so a misbehaving nextPageToken chain cannot
-	// loop forever. Entries past the bound are picked up by the request path creating.
-	listMaxPages = 10
-
-	// reconcileGatePrefix namespaces gate keys. Cache keys are 64 hex characters, so the
-	// prefix cannot collide with them. It is unchanged from before the store moved to
-	// contextcache, so old and new replicas share gates during a rolling deploy.
-	reconcileGatePrefix = "gcpcache:reconcile:"
+	// syncGatePrefix namespaces gate keys. Cache keys are 64 hex characters, so the
+	// prefix cannot collide with them.
+	syncGatePrefix = "gcpcache:sync:"
 )
 
-// cachedContentItem is the subset of a cachedContents list item the reconciler uses.
+// cachedContentItem is the subset of a cachedContents list item the syncer uses.
 type cachedContentItem struct {
 	Name        string `json:"name"`
 	DisplayName string `json:"displayName"`
@@ -52,41 +47,54 @@ type listResponse struct {
 	NextPageToken  string              `json:"nextPageToken"`
 }
 
-// newReconciler returns a reconciler for gcpAuth's project and region. It reports false
-// when the store cannot back one, such as the no-op store.
-func (r *resolver) newReconciler(gcpAuth filterapi.GCPAuthHandler, interval time.Duration) (*contextcache.Reconciler, bool) {
-	rs, ok := r.store.(contextcache.ReconcileStore)
-	if !ok {
-		return nil, false
-	}
-	return &contextcache.Reconciler{
-		Store:    rs,
+// newSyncer returns a syncer. With a nil gcpAuth the source reads the resolver's current
+// credentials each round, so SetAuth takes effect on the next round; a non-nil gcpAuth
+// pins the credentials (used by tests).
+func (r *Resolver) newSyncer(gcpAuth filterapi.GCPAuthHandler, interval time.Duration) *contextcache.Syncer {
+	return &contextcache.Syncer{
+		Store:    r.store,
 		Source:   &listSource{r: r, auth: gcpAuth},
 		Interval: interval,
 		Logger:   r.logger,
-	}, true
+	}
 }
 
 // listSource is a contextcache.Source over cachedContents.list.
 type listSource struct {
-	r    *resolver
+	r    *Resolver
 	auth filterapi.GCPAuthHandler
 	// pages is the number of pages read by the last List call, for tests.
 	pages int
 }
 
+// creds returns the pinned credentials, or the resolver's current ones.
+func (s *listSource) creds() filterapi.GCPAuthHandler {
+	if s.auth != nil {
+		return s.auth
+	}
+	return s.r.GetAuth()
+}
+
 // GateKey implements contextcache.Source.
 func (s *listSource) GateKey() string {
-	return reconcileGatePrefix + s.auth.GCPProject() + "/" + s.auth.GCPRegion()
+	auth := s.creds()
+	if auth == nil {
+		return syncGatePrefix
+	}
+	return syncGatePrefix + auth.GCPProject() + "/" + auth.GCPRegion()
 }
 
 // List implements contextcache.Source. The API has no server-side filter, so the walk
 // reads every entry in the project and region; only gateway-created ones are added.
 func (s *listSource) List(ctx context.Context, add func(string, contextcache.Entry)) error {
 	s.pages = 0
-	region, project := s.auth.GCPRegion(), s.auth.GCPProject()
+	auth := s.creds()
+	if auth == nil {
+		return nil
+	}
+	region, project := auth.GCPRegion(), auth.GCPProject()
 
-	token, err := s.auth.GCPTokenSource().Token()
+	token, err := auth.GCPTokenSource().Token()
 	if err != nil {
 		return fmt.Errorf("get GCP access token: %w", err)
 	}
@@ -96,7 +104,7 @@ func (s *listSource) List(ctx context.Context, add func(string, contextcache.Ent
 	}
 
 	pageToken := ""
-	for s.pages < listMaxPages {
+	for {
 		lr, err := s.r.listPage(ctx, base, token.AccessToken, pageToken)
 		if err != nil {
 			return err
@@ -107,16 +115,11 @@ func (s *listSource) List(ctx context.Context, add func(string, contextcache.Ent
 				add(key, e)
 			}
 		}
-		// An empty token ends the list. A repeated one would loop, so treat it as the end.
-		if lr.NextPageToken == "" || lr.NextPageToken == pageToken {
+		if lr.NextPageToken == "" {
 			return nil
 		}
 		pageToken = lr.NextPageToken
 	}
-	s.r.logger.Warn("gcpcache: reconcile stopped at page limit; later entries were not read",
-		slog.String("project", project), slog.String("region", region),
-		slog.Int("maxPages", listMaxPages))
-	return nil
 }
 
 // toEntry converts a list item. It reports false for items the gateway did not create
@@ -136,7 +139,7 @@ func (s *listSource) toEntry(item cachedContentItem) (string, contextcache.Entry
 
 // listPage fetches one page of cachedContents. It sets the query on a copy of base, so
 // the caller's URL is not altered.
-func (r *resolver) listPage(ctx context.Context, base *url.URL, accessToken, pageToken string) (listResponse, error) {
+func (r *Resolver) listPage(ctx context.Context, base *url.URL, accessToken, pageToken string) (listResponse, error) {
 	u := *base
 	q := url.Values{}
 	q.Set("pageSize", strconv.Itoa(listPageSize))
